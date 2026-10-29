@@ -863,3 +863,11 @@ def test_output_row_schema_all_41_columns():
     for col in v2.OUTPUT_COLUMNS:
         assert col in row, f"Missing output column: {col}"
 
+
+def test_random_selection_flag():
+    args = v2.parse_arguments(["--limit", "10", "--random", "--seed", "42"])
+    assert args.limit == 10
+    assert args.random is True
+    assert args.seed == 42
+
+
