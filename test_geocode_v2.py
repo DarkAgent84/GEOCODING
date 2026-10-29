@@ -163,7 +163,7 @@ def test_poi_224km_away_is_rejected():                          # row 7
 def test_partial_rooftop_wrong_pincode_downgraded():           # rows 0/11/15 style
     r, _ = run("NO 268 RAMAKKA LAYOUT ANEKAL BANGALORE - 562106",
                geo(12.85, 77.58, "ROOFTOP", "Gottigere, Bengaluru, Karnataka 560083, India", partial=True))
-    assert r["confidence_score"] == 10 and r["derivation_type"].endswith("_UNVERIFIED")
+    assert 0 <= r["confidence_score"] <= 9 and r["derivation_type"].endswith("_UNVERIFIED")
     assert "GEOCODE_UNVERIFIED" in r["flags"]
     row = v2.build_row(0, "L1", "addr", "orig", "san", r, [])
     assert row["review_needed"] is True
@@ -377,7 +377,7 @@ def test_cache_hit_costs_no_call_and_errors_are_not_cached(tmp_path):
     c = client([FakeResp(200, OK_GEO)], cache)
     c.geocode("12 Main Road Pune")
     c.geocode("12  main road, PUNE")                 # same after normalisation
-    assert c.stats == {"api_calls": 1, "cache_hits": 1}
+    assert c.stats["api_calls"] == 1 and c.stats["cache_hits"] == 1
     c2 = client([FakeResp(200, {"status": "UNKNOWN_ERROR"})] * v2.MAX_RETRIES, cache)
     with pytest.raises(v2.TransientApiError):
         c2.geocode("another address here 5")
@@ -691,13 +691,16 @@ def test_incomplete_address_skips_api_and_sets_attributes():
     addr = "NO 2 -3 PATIBANDLA GUNTUR - 522402"
     res = v2.derive_coordinates_with_confidence(addr, client)
 
-    assert res["confidence_score"] == 10
+    assert 0 <= res["confidence_score"] <= 9
+    assert res["confidence_score"] == 7
     assert res["category"] == "INCOMPLETE_ADDRESS"
     assert res["derivation_type"] == "INCOMPLETE_ADDRESS (TOO_FEW_WORDS)"
     assert res["recommended_geofence_m"] == 1000
     assert res["verification"] == "INCOMPLETE"
     assert "INCOMPLETE_ADDRESS" in res["flags"]
     assert "TOO_FEW_WORDS" in res["flags"]
+    assert res["geocoding_api_called"] is False
+    assert res["places_api_called"] is False
     # Verify no Google API calls were made
     assert client.places_calls == []
 
@@ -708,11 +711,155 @@ def test_incomplete_address_build_row_flags_and_remarks():
     res = v2.derive_coordinates_with_confidence(addr, client)
     row = v2.build_row(1, "LOAN123", "soa_current_address", addr, addr, res, [])
 
-    assert row["confidence_score"] == 10
+    assert 0 <= row["confidence_score"] <= 9
+    assert row["confidence_score"] == 5
     assert row["score_category"] == "INCOMPLETE_ADDRESS"
     assert row["derivation_type"] == "INCOMPLETE_ADDRESS (MISSING_PINCODE)"
     assert row["review_needed"] is True
     assert "INCOMPLETE_ADDRESS" in row["flags"]
     assert "MISSING_PINCODE" in row["flags"]
     assert "missing 6-digit Indian postal pincode" in row["remarks"]
+    assert row["geocoding_api_called"] is False
+    assert row["places_api_called"] is False
+
+
+# --------------------------------------------------------------------------
+# Stage 2: Duplicate or Conflicting PIN Code Detection Tests (11-20)
+# --------------------------------------------------------------------------
+def test_stage2_conflicting_pincodes_detection():
+    client = FakeClient(ZERO, ZERO)
+    addr = "Malad West, Mumbai, Maharashtra 400064 400097"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+
+    assert 11 <= res["confidence_score"] <= 20
+    assert res["confidence_score"] == 15
+    assert res["category"] == "DOUBLE_PINCODE"
+    assert res["processing_stage"] == "STAGE_2_CONFLICTING_PINCODES"
+    assert res["match_classification"] == "DOUBLE_PINCODE"
+    assert res["geocoding_api_called"] is False
+    assert res["places_api_called"] is False
+    assert res["lat"] is None and res["lng"] is None
+    assert set(res["pins"]) == {"400064", "400097"}
+    assert "DOUBLE_PINCODE" in res["flags"]
+
+    row = v2.build_row(2, "LOAN201", "soa_current_address", addr, addr, res, [])
+    assert row["confidence_score"] == 15
+    assert row["pincode_count"] == 2
+    assert "400064" in row["pincode_list"] and "400097" in row["pincode_list"]
+    assert row["review_needed"] is True
+
+
+def test_stage2_identical_repeated_pincode_not_flagged_as_conflicting():
+    addr = "2/156 GALI NO 3 SUDAMAPURI ALIGARH 202001 - 202001"
+    san, flags = v2.sanitize_address(addr)
+    pins = v2._pincodes(san)
+    assert len(pins) == 1
+    assert "DOUBLE_PINCODE" not in flags
+
+
+# --------------------------------------------------------------------------
+# Stage 3: Spelling Mistake Detection Tests (21-30)
+# --------------------------------------------------------------------------
+def test_stage3_spelling_mistake_detection():
+    client = FakeClient(ZERO, ZERO)
+    addr = "Near Civil hospitl, M G Road, Pune, Maharashtra 411001"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+
+    assert 21 <= res["confidence_score"] <= 30
+    assert res["confidence_score"] == 25
+    assert res["category"] == "SPELLING_ERROR"
+    assert res["processing_stage"] == "STAGE_3_SPELLING_ERROR"
+    assert res["match_classification"] == "SPELLING_ERROR"
+    assert res["spelling_error_detected"] is True
+    assert "hospitl" in res["suspected_misspelled_words"]
+    assert "hospital" in res["suggested_spelling_corrections"]
+    assert res["geocoding_api_called"] is False
+    assert res["places_api_called"] is False
+    assert res["lat"] is None and res["lng"] is None
+
+    row = v2.build_row(3, "LOAN301", "soa_current_address", addr, addr, res, [])
+    assert row["confidence_score"] == 25
+    assert row["spelling_error_detected"] is True
+    assert "hospitl" in row["suspected_misspelled_words"]
+    assert "hospital" in row["suggested_spelling_corrections"]
+    assert "Spelling error detected" in row["remarks"]
+
+
+def test_stage3_valid_regional_alternatives_not_misidentified():
+    alts = [
+        "15 MG Road, Bengaluru, Karnataka 560001",
+        "15 MG Road, Bangalore, Karnataka 560001",
+        "Nariman Point, Bombay, Maharashtra 400021",
+        "Nariman Point, Mumbai, Maharashtra 400021",
+    ]
+    for a in alts:
+        has_err, is_unc, suspected, corrs = v2.detect_spelling_errors(a)
+        assert has_err is False, f"False positive spelling error for {a}: {suspected}"
+
+
+# --------------------------------------------------------------------------
+# Stage 4: Synonym & Entity Normalization Tests (60-70)
+# --------------------------------------------------------------------------
+def test_stage4_synonym_normalization_applied():
+    client = FakeClient(
+        geo(19.186, 72.848, "ROOFTOP", "Near Shiv Temple, Chincholi Bunder, Malad West, Mumbai, Maharashtra 400064, India"),
+        ZERO
+    )
+    addr = "Near Shiv Mandir, Chincholi Bunder, Malad West, Mumbai, Maharashtra 400064"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+
+    assert res["synonym_normalization_applied"] is True
+    assert "mandir->temple" in res["normalized_terms"]
+    assert "temple" in res["normalized_address"].lower()
+    assert 60 <= res["synonym_score"] <= 70
+    assert res["geocoding_api_called"] is True
+
+    row = v2.build_row(4, "LOAN401", "soa_current_address", addr, addr, res, [])
+    assert row["original_address"] == addr
+    assert "temple" in row["normalized_address"].lower()
+    assert row["synonym_normalization_applied"] is True
+    assert "mandir->temple" in row["normalized_terms"]
+
+
+# --------------------------------------------------------------------------
+# Stage 5 & 6: POI Exact Match (90-99) and Strict Exact Match (100)
+# --------------------------------------------------------------------------
+def test_stage5_verified_poi_exact_match():
+    addr = "THE MEHSANA DIST CENTRAL CO OP BANK LTD TINBATTI BH MAMLATDAR OFFICE AT TA KADI DI MEHSANA - 382715"
+    client = FakeClient(
+        geo(23.3015, 72.3304, "ROOFTOP", "Tinbatti, Kadi, Gujarat 382715, India", partial=True),
+        places(place("Mehsana District Central Co-operative Bank Ltd, Kadi",
+                     "Tinbatti, Kadi, Gujarat 382715", ["bank", "establishment"], 23.3015, 72.3304))
+    )
+    res = v2.derive_coordinates_with_confidence(addr, client)
+    assert 90 <= res["confidence_score"] <= 99
+    assert res["match_classification"] == "POI_EXACT"
+    assert res["processing_stage"] == "STAGE_5_POI_MATCH"
+    assert res["geocoding_api_called"] is True
+    assert res["places_api_called"] is True
+
+
+def test_stage6_strict_exact_match():
+    addr = "NO.24/9 KAVARAI STREET VADAPALANI CHENNAI - 600026"
+    client = FakeClient(
+        geo(13.05, 80.21, "ROOFTOP", "24/9, Kavarai St, Vadapalani, Chennai 600026, India", partial=False)
+    )
+    res = v2.derive_coordinates_with_confidence(addr, client)
+    assert res["confidence_score"] == 100
+    assert res["match_classification"] == "EXACT_MATCH"
+    assert res["processing_stage"] == "STAGE_6_EXACT_MATCH"
+    assert res["location_type"] == "ROOFTOP"
+    assert res["geocoding_api_called"] is True
+    assert res["places_api_called"] is False
+
+
+def test_output_row_schema_all_41_columns():
+    client = FakeClient(ZERO, ZERO)
+    addr = "NO.24/9 KAVARAI STREET VADAPALANI CHENNAI - 600026"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+    row = v2.build_row(10, "LOAN999", "soa_current_address", addr, addr, res, [])
+
+    assert len(row) == len(v2.OUTPUT_COLUMNS)
+    for col in v2.OUTPUT_COLUMNS:
+        assert col in row, f"Missing output column: {col}"
 
