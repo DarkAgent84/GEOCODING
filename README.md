@@ -21,8 +21,16 @@ Built to run locally while integrating seamlessly with **PostgreSQL** for input 
   * Reads input addresses from `public.geocoding`.
   * Writes verified coordinates and scores into `public.geocoding_processed`.
   * Shared API Response Cache in `public.geocode_cache` (`JSONB`), avoiding redundant API spend across team members.
+* **3-Constraint Incomplete Address Detection & Deep Categorization**:
+  * Pre-filters incomplete addresses before making API calls, saving API costs and avoiding false geocodes.
+  * Evaluates addresses strictly on **3 constraints**:
+    1. **Address Length**: Minimum 15 characters (`ADDRESS_TOO_SHORT`).
+    2. **Major Words Count**: Requires **more than 3 major words** (`> 3`, i.e. $\ge 4$ words; $\le 3$ fails with `TOO_FEW_WORDS`).
+    3. **6-Digit Numeric Pincode**: Requires a valid 6-digit Indian postal code `[1-9]\d{5}` (`MISSING_PINCODE`).
+  * Deeply categorized into subcategories: `MISSING_PINCODE`, `TOO_FEW_WORDS`, `ADDRESS_TOO_SHORT`, `TOO_SHORT_AND_FEW_WORDS`, `MISSING_PIN_AND_FEW_WORDS`, `MISSING_PIN_AND_TOO_SHORT`, `ALL_CRITERIA_FAILED`.
+  * Automatically assigned `Confidence Score: 10`, `Geofence: 1000m`, and `review_needed: True` with plain-language diagnostic remarks.
 * **100% Offline Automated Test Suite**:
-  * 76 unit and regression tests simulating Google responses and network failure recovery without incurring API costs.
+  * 84 unit and regression tests simulating Google responses, edge cases, and network failure recovery without incurring API costs.
 
 ---
 
@@ -37,7 +45,7 @@ Built to run locally while integrating seamlessly with **PostgreSQL** for input 
 | **45** | `INTERPOLATED` | Interpolated address along a street segment | **250 m** |
 | **40–50** | `SPELLING_MISTAKE`| High fuzzy string match to a named premise | **250 m** |
 | **25** | `STREET_LEVEL` | Geocoder found the street only; building unknown | **1000 m** |
-| **10** | `INCOMPLETE_ADDRESS`| Locality / village / post office level only | **1000 m** |
+| **10** | `INCOMPLETE_ADDRESS`| Fails completeness constraints (short, <= 3 words, or missing pincode) | **1000 m** |
 | **0** | `NOT_FOUND` / `INVALID` | Blank address or unrecognizable string | *None* |
 
 ---
@@ -119,3 +127,4 @@ pytest test_geocode_v2.py -v
 
 ## 📄 License
 Internal proprietary software for Credility Data Ingestion.
+

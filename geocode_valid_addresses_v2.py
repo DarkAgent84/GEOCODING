@@ -117,6 +117,14 @@ SINGLE_WORD_SPELLING_MIN = 0.90     # stricter when only one distinctive word is
 MIN_TOKEN_SIMILARITY = 0.70         # every distinctive word must be at least this close
 MIN_MEANINGFUL_WORDS = 2            # fewer place words than this -> address too vague
 
+# Incomplete address detection constraints (3 constraints only)
+MIN_ADDRESS_CHARS = 15              # Constraint 1: minimum total characters
+MIN_MAJOR_WORDS = 3                 # Constraint 2: requires MORE than 3 major words (> 3, so <= 3 fails)
+STOPWORDS = {
+    "the", "of", "and", "in", "at", "to", "for", "from",
+    "near", "nr", "opp", "opposite", "behind", "beside",
+}
+
 # Geometry
 PRECISE_GEOCODE_TYPES = {"ROOFTOP", "RANGE_INTERPOLATED"}
 FAR_LIMIT_M = {"ROOFTOP": 10_000, "RANGE_INTERPOLATED": 10_000,
@@ -148,7 +156,8 @@ ERROR_DERIVATION = "PROCESSING_ERROR"
 # Flags that mean "a human should look at this row"
 REVIEW_FLAGS = {"GEOCODE_UNVERIFIED", "PIN_MISMATCH", "PIN_MISMATCH_CORROBORATED",
                 "POI_PIN_MISMATCH", "POI_GEOCODE_DISAGREE", "DOUBLE_PINCODE", "CONFLICTING_PINCODES",
-                "ADDRESS_TRUNCATED", ERROR_DERIVATION}
+                "ADDRESS_TRUNCATED", "INCOMPLETE_ADDRESS", "MISSING_PINCODE", "TOO_FEW_WORDS",
+                "ADDRESS_TOO_SHORT", ERROR_DERIVATION}
 
 
 class ApiAbort(Exception):
@@ -201,6 +210,74 @@ def _fuzzy_in(token: str, tokens, threshold: float = 0.85) -> bool:
 def _pincodes(text) -> set:
     """All 6-digit Indian pincodes in `text`."""
     return set(re.findall(r"(?<!\d)[1-9]\d{5}(?!\d)", str(text)))
+
+
+def get_major_words(text: str) -> list:
+    """
+    Extract major words from an address:
+    tokens >= 3 characters, containing at least one letter, not purely numeric, and not in STOPWORDS.
+    """
+    cleaned = re.sub(r"[^\w\s]", " ", str(text)).replace("_", " ")
+    return [
+        t for t in cleaned.split()
+        if len(t) >= 3 and any(c.isalpha() for c in t) and t.lower() not in STOPWORDS
+    ]
+
+
+def check_address_completeness(address: str, min_len: int = MIN_ADDRESS_CHARS, min_words: int = MIN_MAJOR_WORDS):
+    """
+    Incomplete address detection based strictly on 3 constraints:
+      1. Total length of address >= min_len (default 15 characters)
+      2. Total more than 3 major words (> 3, i.e. >= 4 major words)
+      3. Pincode present and 6 numeric digits ([1-9]\\d{5})
+
+    Deep categorization subcategories:
+      - MISSING_PINCODE: only missing 6-digit pincode
+      - TOO_FEW_WORDS: only too few major words (<= 3)
+      - ADDRESS_TOO_SHORT: only length below min_len
+      - TOO_SHORT_AND_FEW_WORDS: both too short and too few words
+      - MISSING_PIN_AND_FEW_WORDS: missing pincode and too few words
+      - MISSING_PIN_AND_TOO_SHORT: missing pincode and too short
+      - ALL_CRITERIA_FAILED: failed all 3 criteria
+
+    Returns:
+      (is_incomplete: bool, subcategory: str, fails: list[str], major_words: list[str], pins: set[str])
+    """
+    s = str(address or "").strip()
+    length = len(s)
+    major_words = get_major_words(s)
+    pins = _pincodes(s)
+
+    fails = []
+    if length < min_len:
+        fails.append("ADDRESS_TOO_SHORT")
+    if len(major_words) <= min_words:
+        fails.append("TOO_FEW_WORDS")
+    if not pins:
+        fails.append("MISSING_PINCODE")
+
+    if not fails:
+        return False, "COMPLETE", [], major_words, pins
+
+    fail_set = set(fails)
+    if len(fails) == 3:
+        subcat = "ALL_CRITERIA_FAILED"
+    elif fail_set == {"ADDRESS_TOO_SHORT", "TOO_FEW_WORDS"}:
+        subcat = "TOO_SHORT_AND_FEW_WORDS"
+    elif fail_set == {"MISSING_PINCODE", "TOO_FEW_WORDS"}:
+        subcat = "MISSING_PIN_AND_FEW_WORDS"
+    elif fail_set == {"MISSING_PINCODE", "ADDRESS_TOO_SHORT"}:
+        subcat = "MISSING_PIN_AND_TOO_SHORT"
+    elif fails == ["MISSING_PINCODE"]:
+        subcat = "MISSING_PINCODE"
+    elif fails == ["TOO_FEW_WORDS"]:
+        subcat = "TOO_FEW_WORDS"
+    elif fails == ["ADDRESS_TOO_SHORT"]:
+        subcat = "ADDRESS_TOO_SHORT"
+    else:
+        subcat = "_".join(fails)
+
+    return True, subcat, fails, major_words, pins
 
 
 def haversine_m(lat1, lng1, lat2, lng2) -> float:
@@ -793,18 +870,43 @@ def derive_coordinates_with_confidence(address: str, client) -> dict:
     if len(pins) > 1:
         if "DOUBLE_PINCODE" not in res["flags"]:
             res["flags"].append("DOUBLE_PINCODE")
-        under = (res["confidence_score"], res["category"])
-        res["underlying"] = under
-        if under[0] > 0:                          # NOT_FOUND stays 0: there is no point to score
-            span = SCORE_DOUBLE_PIN_MAX - SCORE_DOUBLE_PIN_MIN
-            res["confidence_score"] = SCORE_DOUBLE_PIN_MIN + int(min(under[0], 100) * span / 100)
-            res["category"] = "DOUBLE_PINCODE"
-            res["recommended_geofence_m"] = geofence_for_score(res["confidence_score"])
+        if res.get("category") != "INCOMPLETE_ADDRESS":
+            under = (res["confidence_score"], res["category"])
+            res["underlying"] = under
+            if under[0] > 0:                          # NOT_FOUND stays 0: there is no point to score
+                span = SCORE_DOUBLE_PIN_MAX - SCORE_DOUBLE_PIN_MIN
+                res["confidence_score"] = SCORE_DOUBLE_PIN_MIN + int(min(under[0], 100) * span / 100)
+                res["category"] = "DOUBLE_PINCODE"
+                res["recommended_geofence_m"] = geofence_for_score(res["confidence_score"])
     return res
 
 
 def _derive_core(address: str, client) -> dict:
     """Geocode, verify, search Places when needed, and return the best candidate with its score."""
+    # 3-Constraint Incomplete Address Detection
+    is_inc, subcat, fails, major_words, pins = check_address_completeness(address)
+    if is_inc:
+        flags = ["INCOMPLETE_ADDRESS"] + [f for f in fails if f != "INCOMPLETE_ADDRESS"]
+        res = _blank_result(
+            status="INCOMPLETE_ADDRESS",
+            source_api="VALIDATION_RULE",
+            derivation_type=f"INCOMPLETE_ADDRESS ({subcat})",
+            category="INCOMPLETE_ADDRESS",
+            confidence_score=SCORE_INCOMPLETE,
+            recommended_geofence_m=geofence_for_score(SCORE_INCOMPLETE),
+            flags=flags,
+            verification="INCOMPLETE",
+            pins=list(pins),
+        )
+        res["completeness_details"] = {
+            "subcat": subcat,
+            "fails": fails,
+            "length": len(address),
+            "major_words": major_words,
+            "pins": list(pins),
+        }
+        return res
+
     ctx = AddrCtx(address)
     g = geocode_lookup(client, address)
     ver = verify_geocode(ctx, g)
@@ -1088,7 +1190,30 @@ def build_remarks(res: dict, flags) -> str:
     elif cat == "STREET_LEVEL":
         parts.append("Only the street was located; no house-level match.")
     elif cat == "INCOMPLETE_ADDRESS":
-        if "GEOCODE_UNVERIFIED" in flags:
+        details = res.get("completeness_details")
+        if details:
+            subcat = details.get("subcat")
+            cnt = len(details.get("major_words") or [])
+            words_list = details.get("major_words") or []
+            words_str = f" ({', '.join(words_list)})" if words_list else ""
+            chars_cnt = details.get("length", 0)
+            if subcat == "MISSING_PINCODE":
+                parts.append("Incomplete address: missing 6-digit Indian postal pincode.")
+            elif subcat == "TOO_FEW_WORDS":
+                parts.append(f"Incomplete address: only {cnt} major word(s){words_str}; requires more than 3 major words.")
+            elif subcat == "ADDRESS_TOO_SHORT":
+                parts.append(f"Incomplete address: address length ({chars_cnt} characters) is below the minimum threshold (15 characters).")
+            elif subcat == "TOO_SHORT_AND_FEW_WORDS":
+                parts.append(f"Incomplete address: address is too short ({chars_cnt} chars) and contains only {cnt} major word(s){words_str}.")
+            elif subcat == "MISSING_PIN_AND_FEW_WORDS":
+                parts.append(f"Incomplete address: missing 6-digit pincode and contains only {cnt} major word(s){words_str}.")
+            elif subcat == "MISSING_PIN_AND_TOO_SHORT":
+                parts.append(f"Incomplete address: missing 6-digit pincode and address is too short ({chars_cnt} chars).")
+            elif subcat == "ALL_CRITERIA_FAILED":
+                parts.append(f"Incomplete address: failed all 3 completeness constraints (length: {chars_cnt} chars, {cnt} major word(s), missing 6-digit pincode).")
+            else:
+                parts.append(f"Incomplete address ({subcat}).")
+        elif "GEOCODE_UNVERIFIED" in flags:
             parts.append(f"Google's result ('{fa[:80]}') disagrees with the input pincode/locality, so it is not trusted.")
         elif "TOO_FEW_WORDS" in flags:
             parts.append("Too few place words to locate the address.")

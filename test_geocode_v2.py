@@ -514,7 +514,7 @@ def test_e2e_internal_error_saved_as_error_row_and_run_continues(tmp_path):
 def test_e2e_consecutive_api_failures_abort_and_keep_progress(tmp_path):
     inp = str(tmp_path / "in.csv")
     write_input(inp, [("L0", "NO.24/9 KAVARAI STREET VADAPALANI CHENNAI - 600026")] +
-                [(f"L{i}", f"FAIL STREET {i} SOMEWHERE ONE") for i in range(1, 9)])
+                [(f"L{i}", f"FAIL STREET {i} SOMEWHERE ONE - 600001") for i in range(1, 9)])
     code, out, _ = go(tmp_path, client_obj=ScriptedClient(fail_on="FAIL"))
     assert code == 1 and [r["input_row"] for r in read_out(out)] == ["0"]
 
@@ -615,4 +615,104 @@ def test_db_mode_dry_run_and_execution(monkeypatch):
     cobj = ScriptedClient()
     code = v2.main(["--db", "--limit", "1", "--no-cache"], client_factory=lambda a, c: cobj)
     assert code == 0
+
+
+# --------------------------------------------------------------------------
+# 3-Constraint Incomplete Address Detection & Deep Categorization
+# --------------------------------------------------------------------------
+def test_completeness_valid_address():
+    addr = "NO.24/9 KAVARAI STREET VADAPALANI CHENNAI - 600026"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is False
+    assert subcat == "COMPLETE"
+    assert fails == []
+    assert len(words) > 3
+    assert "600026" in pins
+
+
+def test_completeness_missing_pincode_deep_categorization():
+    # 5-digit pincode -> missing 6-digit numeric pincode
+    addr = "639, MARIYAMMAN KOIL STREET MAMANGALAM - 80682"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is True
+    assert subcat == "MISSING_PINCODE"
+    assert fails == ["MISSING_PINCODE"]
+    assert len(words) > 3
+
+    # Trailing hyphen without pincode
+    addr2 = "11/63 VINAYAGAR KOVIL STREET KOVAIPUDUR KULATHUPALAYAM -"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr2)
+    assert is_inc is True
+    assert subcat == "MISSING_PINCODE"
+    assert fails == ["MISSING_PINCODE"]
+
+
+def test_completeness_too_few_words_deep_categorization():
+    # 2 major words (Patibandla, Guntur) with valid pincode and length >= 15
+    addr = "NO 2 -3 PATIBANDLA GUNTUR - 522402"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is True
+    assert subcat == "TOO_FEW_WORDS"
+    assert fails == ["TOO_FEW_WORDS"]
+    assert len(words) == 2
+    assert "522402" in pins
+
+
+def test_completeness_too_short_and_few_words():
+    # Len 14 (< 15) and 1 major word ('ASIND' <= 3) with valid pincode
+    addr = "ASIND - 311607"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is True
+    assert subcat == "TOO_SHORT_AND_FEW_WORDS"
+    assert set(fails) == {"ADDRESS_TOO_SHORT", "TOO_FEW_WORDS"}
+    assert "311607" in pins
+
+
+def test_completeness_missing_pin_and_few_words():
+    # Len 17 (>= 15), 2 major words (<= 3), no pincode
+    addr = "PATIBANDLA GUNTUR"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is True
+    assert subcat == "MISSING_PIN_AND_FEW_WORDS"
+    assert set(fails) == {"MISSING_PINCODE", "TOO_FEW_WORDS"}
+
+
+def test_completeness_all_criteria_failed():
+    # Len 6 (< 15), 1 major word (<= 3), no pincode
+    addr = "GUNTUR"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is True
+    assert subcat == "ALL_CRITERIA_FAILED"
+    assert set(fails) == {"ADDRESS_TOO_SHORT", "TOO_FEW_WORDS", "MISSING_PINCODE"}
+
+
+def test_incomplete_address_skips_api_and_sets_attributes():
+    client = FakeClient(ZERO, ZERO)
+    addr = "NO 2 -3 PATIBANDLA GUNTUR - 522402"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+
+    assert res["confidence_score"] == 10
+    assert res["category"] == "INCOMPLETE_ADDRESS"
+    assert res["derivation_type"] == "INCOMPLETE_ADDRESS (TOO_FEW_WORDS)"
+    assert res["recommended_geofence_m"] == 1000
+    assert res["verification"] == "INCOMPLETE"
+    assert "INCOMPLETE_ADDRESS" in res["flags"]
+    assert "TOO_FEW_WORDS" in res["flags"]
+    # Verify no Google API calls were made
+    assert client.places_calls == []
+
+
+def test_incomplete_address_build_row_flags_and_remarks():
+    client = FakeClient(ZERO, ZERO)
+    addr = "639, MARIYAMMAN KOIL STREET MAMANGALAM - 80682"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+    row = v2.build_row(1, "LOAN123", "soa_current_address", addr, addr, res, [])
+
+    assert row["confidence_score"] == 10
+    assert row["score_category"] == "INCOMPLETE_ADDRESS"
+    assert row["derivation_type"] == "INCOMPLETE_ADDRESS (MISSING_PINCODE)"
+    assert row["review_needed"] is True
+    assert "INCOMPLETE_ADDRESS" in row["flags"]
+    assert "MISSING_PINCODE" in row["flags"]
+    assert "missing 6-digit Indian postal pincode" in row["remarks"]
 
