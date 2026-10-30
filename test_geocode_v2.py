@@ -788,6 +788,37 @@ def test_stage3_spelling_mistake_detected_offline_no_api():
     assert res["lat"] is None and res["lng"] is None
 
 
+def test_stage3_landmark_typo_manidr_suggests_mandir_no_api():
+    # Exact address from Row 1: MANIDR typo should suggest 'mandir' (not 'manipur'), score 21-30, no API calls
+    client = FakeClient(ZERO, ZERO)
+    addr = "WARD NO 17 UMARIYA ROAD KHITOLA BASTI SIHORA SHIV MANIDR - 483225"
+    res = v2.derive_coordinates_with_confidence(addr, client)
+
+    assert 21 <= res["confidence_score"] <= 30
+    assert res["match_classification"] == "SPELLING_ERROR"
+    assert res["processing_stage"] == "STAGE_3_SPELLING_VALIDATION"
+    assert res["spelling_error_detected"] is True
+    assert "MANIDR" in res["suspected_misspelled_words"]
+    assert "mandir" in res["suggested_spelling_corrections"]
+    assert "manipur" not in res["suggested_spelling_corrections"]
+    assert res["geocoding_api_called"] is False
+    assert res["places_api_called"] is False
+    assert res["lat"] is None and res["lng"] is None
+
+    row = v2.build_row(3797, "FEDJBLSTL0553084", "soa_current_address", addr, addr, res, [])
+    assert "Suspected spelling mistake in address: 'MANIDR' (suggested: 'mandir'); validation stopped without API calls." in row["remarks"]
+    assert "matched place 'None'" not in row["remarks"]
+
+
+def test_stage3_correctly_spelled_landmark_proceeds_to_geocoding():
+    # Properly spelled SHIV MANDIR should NOT be flagged as spelling error
+    geo_mock = geo(23.48, 80.10, "ROOFTOP", "Khitola, Sihora, Madhya Pradesh 483225, India")
+    res, client = run("WARD NO 17 UMARIYA ROAD KHITOLA BASTI SIHORA SHIV MANDIR - 483225", geo_mock)
+
+    assert res["spelling_error_detected"] is False
+    assert res["geocoding_api_called"] is True
+
+
 def test_stage3_unfamiliar_place_name_not_flagged_as_error():
     # 'Kavarai' is not in known names dictionary, but has no close match -> valid proper noun
     geo_mock = geo(13.05, 80.21, "ROOFTOP", "24/9, Kavarai St, Vadapalani, Chennai 600026, India")

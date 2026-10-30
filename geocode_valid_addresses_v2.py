@@ -619,6 +619,7 @@ KNOWN_GEO_NAMES = {
     "kukatpally", "dilsukhnagar", "charminar", "begumpet", "ameerpet", "kondapur", "miyapur",
     "navrangpura", "satellite", "bodakdev", "vastrapur", "paldi", "maninagar", "naroda",
     "bapunagar", "chandkheda", "gota", "thaltej", "belanganj", "tinbatti",
+    "umaria", "umariya", "sihora", "khitola",
     # Common Geographic Entity Words & Suffixes
     "road", "street", "marg", "rasta", "galli", "gali", "lane", "avenue", "drive", "highway",
     "expressway", "bypass", "chowk", "square", "circle", "crossing", "chauraha", "tiraha",
@@ -654,12 +655,47 @@ VALID_ALTERNATIVES = {
     "pur": {"pore"}, "pore": {"pur"},
 }
 
+# Standard landmark, civic, commercial and infrastructure words for offline spelling validation
+STANDARD_LANDMARK_WORDS = {
+    # Religious / Spiritual
+    "mandir", "temple", "masjid", "mosque", "church", "gurudwara", "dargah", "ashram",
+    "devasthan", "devalaya", "shivalaya", "math", "mutt", "dham", "peeth", "sthan", "chapel",
+    "derasar", "bhavan", "bhawan",
+    # Education
+    "school", "college", "university", "vidyalaya", "academy", "institute", "pathshala",
+    "anganwadi", "coaching", "hostel", "campus",
+    # Health & Medical
+    "hospital", "clinic", "dispensary", "pharmacy", "chemist", "nursing", "medical",
+    "centre", "center", "laboratory", "lab",
+    # Government / Civic / Finance
+    "bank", "office", "police", "thana", "station", "panchayat", "court", "tehsil",
+    "sachivalaya", "post", "corporation", "samiti", "collectorate",
+    # Commercial & Services
+    "basti", "bazaar", "market", "shop", "store", "dukan", "mart", "hotel", "dhaba",
+    "petrol", "pump", "showroom", "godown", "agency", "traders", "enterprises",
+    # Housing & Layout
+    "apartment", "apartments", "society", "tower", "towers", "heights", "complex",
+    "villa", "villas", "residency", "enclave", "layout", "colony", "estate", "house",
+    "plot", "floor", "flat",
+    # Infrastructure & Transit
+    "road", "street", "marg", "lane", "gali", "chowk", "chauraha", "tiraha", "circle",
+    "crossing", "naka", "gate", "stand", "stop", "railway", "junction", "bridge",
+    "flyover", "village", "ward", "block", "sector", "phase", "nagar", "vihar",
+    "puram", "puri", "palli", "halli", "kheda", "gaon",
+}
 
-def detect_spelling_errors(address: str, known_names: set = KNOWN_GEO_NAMES,
+ALL_KNOWN_SPELLING_WORDS = (
+    KNOWN_GEO_NAMES
+    | STANDARD_LANDMARK_WORDS
+    | COMMON_DEITY_WORDS
+)
+
+
+def detect_spelling_errors(address: str, known_names: set = ALL_KNOWN_SPELLING_WORDS,
                            error_threshold: float = SPELLING_ERROR_THRESHOLD,
                            uncertain_min: float = SPELLING_UNCERTAIN_MIN):
     """
-    Stage 3: Offline spelling error detection on geographic words.
+    Stage 3: Offline spelling error detection on geographic and landmark words.
     Returns:
         (has_error: bool, suspected_words: list[str], suggestions: list[str],
          is_uncertain: bool, confidence_score: int)
@@ -676,7 +712,8 @@ def detect_spelling_errors(address: str, known_names: set = KNOWN_GEO_NAMES,
         if len(w_low) < 4:
             continue
         # Exact match to known names or common vocabulary
-        if w_low in known_names or w_low in POI_GENERIC_WORDS or w_low in SYNONYM_DICT:
+        if (w_low in known_names or w_low in POI_GENERIC_WORDS or
+            w_low in SYNONYM_DICT or w_low in COMMON_DEITY_WORDS):
             continue
         # Recognized valid alternate transliteration / historical name
         is_alt = False
@@ -697,6 +734,10 @@ def detect_spelling_errors(address: str, known_names: set = KNOWN_GEO_NAMES,
             if s > best_sim:
                 best_sim = s
                 best_k = k
+            elif s == best_sim and best_k is not None:
+                # Prefer exact character set transposition (anagram match)
+                if set(w_low) == set(k) and set(w_low) != set(best_k):
+                    best_k = k
 
         if best_sim >= error_threshold and best_k != w_low:
             suspected_errors.append(word)
@@ -1614,8 +1655,9 @@ def build_remarks(res: dict, flags) -> str:
     elif cat == "LANDMARK_EXACT":
         parts.append(f"Address is near the landmark '{place}'{near}; coordinates are the landmark's, not the house.")
     elif cat == "SPELLING_MISTAKE":
-        parts.append(f"Spelling mistake: {_pairs(res.get('typos') or [], 'address', 'place name')}; "
-                     f"matched place '{place}'{near}.")
+        if (place or res.get("typos")) and "SPELLING_ERROR" not in flags:
+            parts.append(f"Spelling mistake: {_pairs(res.get('typos') or [], 'address', 'place name')}; "
+                         f"matched place '{place}'{near}.")
     elif cat == "PARTIAL_MATCH":
         parts.append("Google matched only part of the address; house/street detail is not confirmed.")
     elif cat == "INTERPOLATED":
