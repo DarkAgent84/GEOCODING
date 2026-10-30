@@ -58,8 +58,9 @@ Address Input
    * If $> 1$ distinct PIN codes are present (e.g. `400064` and `400097`), classifies as `DOUBLE_PINCODE` (Score: 15) or `MULTIPLE_PINCODES` (Score: 12) and stops immediately without API requests.
 
 3. **Stage 3: Offline Spelling Mistake Detection (Score 21–30 | 0 API Calls)**
-   * High-speed offline token validation against Indian states, union territories, major cities, and common geographic/structural terminology.
-   * Identifies typos (e.g. `Mumbay` $\rightarrow$ `mumbai`, `Maharastra` $\rightarrow$ `maharashtra`) and records suspected words and suggested corrections.
+   * High-speed offline token validation against `ALL_KNOWN_SPELLING_WORDS` encompassing Indian states, union territories, major cities/districts, prominent localities, road suffixes, and canonical `STANDARD_LANDMARK_WORDS` (religious, educational, healthcare, civic, and commercial POIs such as `mandir`, `temple`, `hospital`, `school`, `college`, `masjid`, `church`, `basti`, `station`, etc.) and `COMMON_DEITY_WORDS`.
+   * Identifies typos (e.g. `MANIDR` $\rightarrow$ `mandir`, `Mumbay` $\rightarrow$ `mumbai`, `Maharastra` $\rightarrow$ `maharashtra`) and records suspected words and suggested corrections.
+   * Employs transposition/anagram prioritization so letter-swap typos cleanly resolve to their standard canonical terms.
    * Distinguishes legitimate regional variants and transliterations (e.g. `Bengaluru`/`Bangalore`, `Mumbai`/`Bombay`, `Chennai`/`Madras`, `Vadodara`/`Baroda`).
    * Unfamiliar local names (e.g. `Kavarai`, `Patibandla`) without close matches are recognized as valid proper nouns and never falsely flagged.
    * Ambiguous words are handled via configurable `SPELLING_UNCERTAIN_POLICY`.
@@ -144,7 +145,7 @@ The output CSV and PostgreSQL table `public.geocoding_processed` produce all req
 | `flags` | TEXT | Semicolon-delimited audit flags |
 | `review_needed` | BOOLEAN | `True` if human inspection is advised |
 | `remarks` | TEXT | Plain-language audit sentence |
-| `script_version` | TEXT | Script version identifier (`3.0`) |
+| `script_version` | TEXT | Script version identifier (`3.1`) |
 
 ---
 
@@ -222,7 +223,7 @@ Run the offline test suite (no network or API key required):
 ```bash
 pytest test_geocode_v2.py -v
 ```
-**Results**: 95 tests passing in ~3.7 seconds.
+**Results**: 100 tests passing in ~4.2 seconds.
 
 ---
 

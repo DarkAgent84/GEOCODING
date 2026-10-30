@@ -14,6 +14,7 @@ import psycopg2
 from psycopg2 import extras
 import pandas as pd
 import numpy as np
+from geocode_valid_addresses_v2 import ensure_db_tables
 
 def load_env():
     for cand in [".env", os.path.join(os.path.dirname(__file__), ".env"), os.path.join(os.path.dirname(__file__), "..", ".env")]:
@@ -41,63 +42,7 @@ def get_conn():
     )
 
 def create_tables(conn, schema="public"):
-    cur = conn.cursor()
-    cur.execute(f"""
-    CREATE TABLE IF NOT EXISTS {schema}.geocoding (
-        id BIGSERIAL,
-        soa_loan_no TEXT PRIMARY KEY,
-        soa_current_address TEXT,
-        soa_property_address TEXT,
-        follow_new_address TEXT,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_geocoding_id ON {schema}.geocoding(id);
-    CREATE INDEX IF NOT EXISTS idx_geocoding_current_address ON {schema}.geocoding(soa_current_address);
-
-    CREATE TABLE IF NOT EXISTS {schema}.geocoding_processed (
-        id BIGSERIAL PRIMARY KEY,
-        input_row INTEGER,
-        soa_loan_no TEXT NOT NULL,
-        address_column TEXT NOT NULL DEFAULT 'soa_current_address',
-        original_address TEXT,
-        sanitized_address TEXT,
-        latitude DOUBLE PRECISION,
-        longitude DOUBLE PRECISION,
-        geocode_status TEXT,
-        source_api TEXT,
-        derivation_type TEXT,
-        location_type TEXT,
-        geocode_location_type TEXT,
-        distance_between_apis_m DOUBLE PRECISION,
-        confidence_score INTEGER,
-        score_category TEXT,
-        name_match_ratio DOUBLE PRECISION,
-        place_name TEXT,
-        place_types TEXT,
-        recommended_geofence_radius_m INTEGER,
-        geocode_formatted_address TEXT,
-        address_verification TEXT,
-        flags TEXT,
-        review_needed BOOLEAN,
-        remarks TEXT,
-        script_version TEXT,
-        processed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT uq_geocoding_processed_loan_col UNIQUE (soa_loan_no, address_column)
-    );
-    CREATE INDEX IF NOT EXISTS idx_geocoding_proc_loan_no ON {schema}.geocoding_processed(soa_loan_no);
-    CREATE INDEX IF NOT EXISTS idx_geocoding_proc_score_category ON {schema}.geocoding_processed(score_category);
-    CREATE INDEX IF NOT EXISTS idx_geocoding_proc_review_needed ON {schema}.geocoding_processed(review_needed);
-    CREATE INDEX IF NOT EXISTS idx_geocoding_proc_derivation ON {schema}.geocoding_processed(derivation_type);
-
-    CREATE TABLE IF NOT EXISTS {schema}.geocode_cache (
-        key TEXT PRIMARY KEY,
-        response JSONB NOT NULL,
-        saved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_geocode_cache_saved_at ON {schema}.geocode_cache(saved_at);
-    """)
-    conn.commit()
-    cur.close()
+    ensure_db_tables(conn, schema, input_table="geocoding", output_table="geocoding_processed", cache_table="geocode_cache")
 
 def print_status(conn, schema="public"):
     create_tables(conn, schema)
