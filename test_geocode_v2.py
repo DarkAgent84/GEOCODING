@@ -887,4 +887,15 @@ def test_stage3_spelling_uncertain_policy_switch(monkeypatch):
     assert not has_err
 
 
+def test_e2e_random_sampling_with_seed(tmp_path):
+    # Test random sampling with reproducible seed
+    code, out, c = go(tmp_path, extra=["--limit", "2", "--random", "--seed", "42"])
+    rows = read_out(out)
+    assert code == 0
+    assert len(rows) == 2
+    # Verify rows were sampled
+    sampled_indices = [r["input_row"] for r in rows]
+    assert len(sampled_indices) == 2
+
+
 

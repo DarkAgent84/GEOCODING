@@ -187,6 +187,18 @@ GOOGLE_API_KEY=your_google_maps_api_key
 python geocode_valid_addresses_v2.py --input GEOCODING.csv --dry-run
 ```
 
+#### Run N Random Rows (Sampling):
+```bash
+# Process 20 random addresses from CSV:
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --output random_sample.csv --limit 20 --random
+
+# Reproducible random sampling with seed:
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --limit 20 --random --seed 42
+
+# In Database Mode:
+python geocode_valid_addresses_v2.py --db --limit 20 --random
+```
+
 #### Run in CSV Mode:
 ```bash
 python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --batch-size 20

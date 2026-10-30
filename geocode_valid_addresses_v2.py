@@ -2075,9 +2075,13 @@ def _run_db(args, api_key, client_factory) -> int:
     rows = cur.fetchall()
     total_pending = len(rows)
 
+    if args.random:
+        if args.seed is not None:
+            random.seed(args.seed)
+        random.shuffle(rows)
     if args.limit is not None:
         rows = rows[:max(0, args.limit)]
-        print(f"Found {total_pending} pending rows; processing up to {len(rows)} (limit = {args.limit})")
+        print(f"Found {total_pending} pending rows; processing up to {len(rows)} {'random ' if args.random else ''}(limit = {args.limit})")
     else:
         print(f"Rows to process from {db_schema}.{input_table}: {len(rows)}")
 
@@ -2218,6 +2222,8 @@ def parse_arguments(argv=None):
     p.add_argument("--address-col", "-a", default=None, help="Address column (auto-detects soa_current_address / Addresses / address)")
     p.add_argument("--loan-col", "-l", default="soa_loan_no", help="Loan number column (default: soa_loan_no)")
     p.add_argument("--limit", "-n", type=int, default=None, help="Process at most N NEW rows this run")
+    p.add_argument("--random", "-r", action="store_true", help="Sample N random rows instead of first N sequential rows")
+    p.add_argument("--seed", type=int, default=None, help="Random seed for reproducible sampling (e.g. --seed 42)")
     p.add_argument("--batch-size", "-b", type=int, default=20, help="Rows per save to CSV / PostgreSQL (default: 20)")
     p.add_argument("--region", default="in", help="Region bias for Google (default: in)")
     p.add_argument("--cache-db", default=DEFAULT_CACHE_DB, help=f"SQLite cache file (default: {DEFAULT_CACHE_DB})")
@@ -2361,9 +2367,13 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
         write_header(output_csv)
 
     todo = [i for i in range(total_records) if i not in processed_rows]
+    if args.random:
+        if args.seed is not None:
+            random.seed(args.seed)
+        random.shuffle(todo)
     if args.limit is not None:
         todo = todo[:max(0, args.limit)]
-        print(f"Processing up to {len(todo)} new rows (limit = {args.limit})")
+        print(f"Processing up to {len(todo)} new {'random ' if args.random else ''}rows (limit = {args.limit})")
     print(f"Rows to process: {len(todo)}")
 
     # ---- client ------------------------------------------------------------
