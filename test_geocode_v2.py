@@ -611,10 +611,13 @@ def test_db_mode_dry_run_and_execution(monkeypatch):
     # dry run in DB mode
     assert v2.main(["--db", "--dry-run"]) == 0
 
-    # run in DB mode with mock geocoding client
+    # run in DB mode with mock geocoding client (workers 1 and workers 2)
     cobj = ScriptedClient()
     code = v2.main(["--db", "--limit", "1", "--no-cache"], client_factory=lambda a, c: cobj)
     assert code == 0
+
+    code_w2 = v2.main(["--db", "--limit", "1", "--no-cache", "--workers", "2"], client_factory=lambda a, c: cobj)
+    assert code_w2 == 0
 
 
 # --------------------------------------------------------------------------
@@ -943,5 +946,110 @@ def test_complete_address_with_area_level_geocode_scores_area_level():
     assert row["processing_stage"] == "STAGE_GEOCODING_AREA"
     assert "Area-level match" in row["remarks"]
 
+# --------------------------------------------------------------------------
+# Multiprocessing and Concurrency Tests
+# --------------------------------------------------------------------------
+def test_multithreading_workers_e2e(tmp_path):
+    code, out, c = go(tmp_path, extra=["--workers", "3", "--worker-mode", "thread"])
+    rows = read_out(out)
+    assert code == 0
+    assert [r["input_row"] for r in rows] == ["0", "1", "2", "3"]
+    assert rows[0]["score_category"] == "ROOFTOP_EXACT" and rows[0]["recommended_geofence_radius_m"] == "50"
+    assert rows[1]["derivation_type"] == "INVALID_INPUT"
+    assert rows[2]["confidence_score"] == "100"
+    assert rows[3]["score_category"] == "NOT_FOUND"
+    assert not os.path.exists(out + ".lock")
 
+
+def test_multiprocessing_workers_short_flag(tmp_path):
+    code, out, c = go(tmp_path, extra=["-w", "2"])
+    rows = read_out(out)
+    assert code == 0
+    assert len(rows) == 4
+    assert [r["input_row"] for r in rows] == ["0", "1", "2", "3"]
+
+
+def test_workers_with_random_sampling(tmp_path):
+    code, out, c = go(tmp_path, extra=["--workers", "2", "--limit", "2", "--random", "--seed", "42"])
+    rows = read_out(out)
+    assert code == 0
+    assert len(rows) == 2
+
+
+def test_workers_transient_failure_handling(tmp_path):
+    code, out, _ = go(tmp_path, extra=["--workers", "2"], client_obj=ScriptedClient(fail_on="UNKNOWN"))
+    rows = read_out(out)
+    assert code == 0
+    assert "3" not in [r["input_row"] for r in rows]
+
+
+def test_workers_internal_error_handling(tmp_path):
+    class Exploding(ScriptedClient):
+        def geocode(self, address):
+            if "UNKNOWN" in address:
+                raise RuntimeError("worker boom")
+            return super().geocode(address)
+
+    code, out, _ = go(tmp_path, extra=["--workers", "2"], client_obj=Exploding())
+    rows = read_out(out)
+    assert code == 0
+    assert len(rows) == 4
+    assert rows[3]["derivation_type"] == v2.ERROR_DERIVATION
+    assert rows[3]["review_needed"] == "YES"
+
+
+def test_real_multiprocessing_pool_with_sqlite_cache(tmp_path):
+    in_csv = str(tmp_path / "mp_in.csv")
+    out_csv = str(tmp_path / "mp_out.csv")
+    cache_db = str(tmp_path / "mp_cache.db")
+
+    addr = "NO.24/9 KAVARAI STREET VADAPALANI CHENNAI - 600026"
+    with open(in_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["soa_loan_no", "soa_current_address"])
+        w.writerow(["L1", addr])
+        w.writerow(["L2", ""])
+        w.writerow(["L3", addr])
+
+    cache = v2.DiskCache(cache_db)
+    norm = v2._normalize(addr)
+    key = f"geo3|in|{norm}"
+    mock_resp = {
+        "status": "OK",
+        "results": [{
+            "formatted_address": "24/9, Kavarai St, Vadapalani, Chennai 600026, India",
+            "types": ["street_address"],
+            "components": [
+                {"long_name": "600026", "types": ["postal_code"]},
+                {"long_name": "Chennai", "types": ["locality"]},
+            ],
+            "geometry": {"location": {"lat": 13.05, "lng": 80.21}, "location_type": "ROOFTOP"},
+            "partial_match": False,
+            "place_id": "test_place_id",
+        }]
+    }
+    cache.set(key, mock_resp)
+    cache.close()
+
+    import subprocess
+    script_path = os.path.join(HERE, "geocode_valid_addresses_v2.py")
+    res = subprocess.run([
+        sys.executable, script_path,
+        "-i", in_csv,
+        "-o", out_csv,
+        "--cache-db", cache_db,
+        "--cache-only",
+        "--workers", "2",
+        "--worker-mode", "process"
+    ], cwd=HERE, capture_output=True, text=True)
+
+    assert res.returncode == 0
+    rows = read_out(out_csv)
+    assert len(rows) == 3
+    assert rows[0]["score_category"] == "ROOFTOP_EXACT"
+    assert rows[0]["confidence_score"] == "100"
+    assert float(rows[0]["latitude"]) == 13.05
+    assert float(rows[0]["longitude"]) == 80.21
+    assert rows[1]["derivation_type"] == "INVALID_INPUT"
+    assert rows[2]["confidence_score"] == "100"
 

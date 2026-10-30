@@ -50,11 +50,13 @@ Usage examples
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import difflib
 import functools
 import json
 import math
+import multiprocessing
 import os
 import random
 import re
@@ -70,7 +72,7 @@ from datetime import datetime
 import pandas as pd
 import requests
 
-SCRIPT_VERSION = "3.0"
+SCRIPT_VERSION = "3.1"
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -769,9 +771,10 @@ class DiskCache:
 
     def __init__(self, path, max_age_days=DEFAULT_CACHE_MAX_AGE_DAYS):
         self.max_age_days = max_age_days if (max_age_days and max_age_days > 0) else None
-        self.conn = sqlite3.connect(path, timeout=30)
+        self.conn = sqlite3.connect(path, timeout=60)
         try:
             self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=60000")
         except sqlite3.DatabaseError:
             pass
         self.conn.execute(
@@ -1788,6 +1791,165 @@ def build_row(idx, loan_no, address_col, original, sanitized, res, extra_flags):
 
 
 # --------------------------------------------------------------------------
+# Concurrency and Multiprocessing Worker Helpers
+# --------------------------------------------------------------------------
+_worker_client = None
+_worker_cache = None
+
+
+def _init_worker_process(api_key, region, cache_db, no_cache, cache_only, max_age_days,
+                         max_api_calls=None, db_mode=False, db_config=None):
+    """Initializer executed once by each worker process in multiprocessing.Pool."""
+    global _worker_client, _worker_cache
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    cache = None
+    if not no_cache:
+        if db_mode and db_config:
+            try:
+                import psycopg2
+                conn = psycopg2.connect(
+                    host=db_config.get("host"),
+                    port=db_config.get("port"),
+                    dbname=db_config.get("dbname"),
+                    user=db_config.get("user"),
+                    password=db_config.get("password"),
+                    connect_timeout=10,
+                )
+                cache = PostgresCache(
+                    conn,
+                    schema=db_config.get("schema", "public"),
+                    table=db_config.get("cache_table", "geocode_cache"),
+                    max_age_days=max_age_days,
+                )
+            except Exception as e:
+                print(f"[Worker] Warning: could not connect to PostgreSQL cache: {e}")
+                cache = None
+        elif cache_db:
+            try:
+                cache = DiskCache(cache_db, max_age_days)
+            except Exception as e:
+                print(f"[Worker] Warning: could not open SQLite cache {cache_db}: {e}")
+                cache = None
+
+    _worker_cache = cache
+    _worker_client = ApiClient(api_key, cache, region=region, cache_only=cache_only,
+                               max_api_calls=max_api_calls)
+
+
+def _process_row_task(task: tuple, client=None) -> dict:
+    """
+    Worker task executing sanitize_address, Stage 1-4 checks, Stage 5-6 geocoding/places,
+    and row construction.
+    task: (idx, loan_no, address_col, original)
+    client: ApiClient instance or None (uses worker-local _worker_client if None)
+    """
+    idx, loan_no, address_col, original = task
+    sanitized, san_flags = sanitize_address(original)
+
+    if not sanitized:
+        res = _blank_result(
+            status="Invalid/empty address",
+            derivation_type="INVALID_INPUT",
+            category="INVALID_INPUT",
+        )
+        row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
+        return {
+            "status": "INVALID_INPUT",
+            "idx": idx,
+            "loan_no": loan_no,
+            "sanitized": sanitized,
+            "res": res,
+            "row": row,
+            "api_calls": 0,
+            "cache_hits": 0,
+        }
+
+    c = client or _worker_client
+    if c is None:
+        raise RuntimeError("Worker ApiClient is not initialized")
+
+    calls_before = getattr(c, "stats", {}).get("api_calls", 0)
+    hits_before = getattr(c, "stats", {}).get("cache_hits", 0)
+
+    try:
+        res = derive_coordinates_with_confidence(sanitized, c)
+    except CacheMiss:
+        return {
+            "status": "CACHE_MISS",
+            "idx": idx,
+            "loan_no": loan_no,
+            "sanitized": sanitized,
+            "api_calls": 0,
+            "cache_hits": 0,
+        }
+    except TransientApiError as e:
+        calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
+        hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
+        return {
+            "status": "TRANSIENT_API_ERROR",
+            "idx": idx,
+            "loan_no": loan_no,
+            "sanitized": sanitized,
+            "error": str(e),
+            "api_calls": calls_delta,
+            "cache_hits": hits_delta,
+        }
+    except ApiAbort as e:
+        calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
+        hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
+        return {
+            "status": "API_ABORT",
+            "idx": idx,
+            "loan_no": loan_no,
+            "sanitized": sanitized,
+            "error": str(e),
+            "api_calls": calls_delta,
+            "cache_hits": hits_delta,
+        }
+    except Exception as e:
+        msg = getattr(c, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
+        res = _blank_result(
+            status=msg[:200],
+            derivation_type=ERROR_DERIVATION,
+            category="ERROR",
+            flags=[ERROR_DERIVATION],
+        )
+        row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
+        calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
+        hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
+        return {
+            "status": "INTERNAL_ERROR",
+            "idx": idx,
+            "loan_no": loan_no,
+            "sanitized": sanitized,
+            "error": msg,
+            "res": res,
+            "row": row,
+            "api_calls": calls_delta,
+            "cache_hits": hits_delta,
+        }
+
+    calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
+    hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
+    row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
+    return {
+        "status": "OK",
+        "idx": idx,
+        "loan_no": loan_no,
+        "sanitized": sanitized,
+        "res": res,
+        "row": row,
+        "api_calls": calls_delta,
+        "cache_hits": hits_delta,
+    }
+
+
+# --------------------------------------------------------------------------
 # Database helpers (PostgreSQL)
 # --------------------------------------------------------------------------
 class PostgresCache:
@@ -2173,74 +2335,194 @@ def _run_db(args, api_key, client_factory) -> int:
             saved_total += len(batch)
             batch.clear()
 
-    try:
-        for n, (row_id, loan_no, original) in enumerate(rows, start=1):
-            sanitized, san_flags = sanitize_address(original)
+    workers = getattr(args, "workers", 1) or 1
+    worker_mode = getattr(args, "worker_mode", "process") or "process"
+    if workers < 1:
+        workers = 1
 
-            if not sanitized:
-                res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
-                                    category="INVALID_INPUT")
-                print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: invalid/empty address")
-            else:
-                ckey = _normalize(sanitized)
-                if ckey in memo:
-                    res = memo[ckey]
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: duplicate address -> reused")
+    if workers == 1:
+        try:
+            for n, (row_id, loan_no, original) in enumerate(rows, start=1):
+                sanitized, san_flags = sanitize_address(original)
+
+                if not sanitized:
+                    res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
+                                        category="INVALID_INPUT")
+                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: invalid/empty address")
                 else:
-                    try:
-                        res = derive_coordinates_with_confidence(sanitized, client)
-                    except CacheMiss:
-                        skipped_cache += 1
-                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: not in cache, skipped (--cache-only)")
-                        continue
-                    except TransientApiError as e:
-                        skipped_api += 1
-                        consecutive_api += 1
-                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: API trouble ({e}); "
-                              f"row not saved, it will be retried next run")
-                        if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
-                            raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
-                                           f"errors (last: {e}). Stopping; progress is saved in PostgreSQL.")
-                        continue
-                    except (ApiAbort, KeyboardInterrupt):
-                        raise
-                    except Exception as e:
-                        consecutive_internal += 1
-                        msg = getattr(client, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
-                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: INTERNAL ERROR {msg}")
-                        traceback.print_exc(limit=3)
-                        res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
-                                            category="ERROR", flags=[ERROR_DERIVATION])
-                        if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
-                            batch.append(build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags))
-                            raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                    ckey = _normalize(sanitized)
+                    if ckey in memo:
+                        res = memo[ckey]
+                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: duplicate address -> reused")
                     else:
-                        consecutive_api = consecutive_internal = 0
-                        memo[ckey] = res
-                        time.sleep(REQUEST_PAUSE_S)
-                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
-                              f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
+                        try:
+                            res = derive_coordinates_with_confidence(sanitized, client)
+                        except CacheMiss:
+                            skipped_cache += 1
+                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: not in cache, skipped (--cache-only)")
+                            continue
+                        except TransientApiError as e:
+                            skipped_api += 1
+                            consecutive_api += 1
+                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: API trouble ({e}); "
+                                  f"row not saved, it will be retried next run")
+                            if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
+                                raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
+                                               f"errors (last: {e}). Stopping; progress is saved in PostgreSQL.")
+                            continue
+                        except (ApiAbort, KeyboardInterrupt):
+                            raise
+                        except Exception as e:
+                            consecutive_internal += 1
+                            msg = getattr(client, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
+                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: INTERNAL ERROR {msg}")
+                            traceback.print_exc(limit=3)
+                            res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
+                                                category="ERROR", flags=[ERROR_DERIVATION])
+                            if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
+                                batch.append(build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags))
+                                raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                        else:
+                            consecutive_api = consecutive_internal = 0
+                            memo[ckey] = res
+                            time.sleep(REQUEST_PAUSE_S)
+                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
+                                  f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
 
-            row = build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags)
-            categories[row["score_category"]] += 1
-            review += 1 if row["review_needed"] else 0
-            batch.append(row)
-            if len(batch) >= args.batch_size:
-                flush_db()
-                print(f"   [saved {saved_total} rows so far to PostgreSQL ({db_schema}.{output_table})]")
+                row = build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags)
+                categories[row["score_category"]] += 1
+                review += 1 if row["review_needed"] else 0
+                batch.append(row)
+                if len(batch) >= args.batch_size:
+                    flush_db()
+                    print(f"   [saved {saved_total} rows so far to PostgreSQL ({db_schema}.{output_table})]")
 
-    except ApiAbort as e:
-        print(f"\nSTOPPED: {e}")
-        exit_code = 1
-    except KeyboardInterrupt:
-        print("\nInterrupted; saving what is done to PostgreSQL.")
-        exit_code = 130
-    finally:
-        flush_db()
-        cur.close()
-        conn.close()
-        if cache is not None:
-            cache.close()
+        except ApiAbort as e:
+            print(f"\nSTOPPED: {e}")
+            exit_code = 1
+        except KeyboardInterrupt:
+            print("\nInterrupted; saving what is done to PostgreSQL.")
+            exit_code = 130
+        finally:
+            flush_db()
+            cur.close()
+            conn.close()
+            if cache is not None:
+                cache.close()
+    else:
+        effective_mode = worker_mode
+        if client_factory is not None and effective_mode == "process":
+            effective_mode = "thread"
+
+        print(f"Running with {workers} concurrent workers (mode: {effective_mode})")
+        tasks = [(row_id, loan_no, address_col, original) for (row_id, loan_no, original) in rows]
+
+        pool_context = None
+        try:
+            if effective_mode == "process":
+                db_config = {
+                    "host": db_host,
+                    "port": db_port,
+                    "dbname": db_name,
+                    "user": db_user,
+                    "password": db_password,
+                    "schema": db_schema,
+                    "cache_table": args.cache_table,
+                }
+                init_args = (
+                    api_key,
+                    args.region,
+                    None,
+                    args.no_cache,
+                    args.cache_only,
+                    args.cache_max_age_days,
+                    args.max_api_calls,
+                    True,
+                    db_config,
+                )
+                pool_context = multiprocessing.Pool(
+                    processes=workers,
+                    initializer=_init_worker_process,
+                    initargs=init_args,
+                )
+                task_iter = pool_context.imap(_process_row_task, tasks, chunksize=1)
+            else:
+                pool_context = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                worker_func = functools.partial(_process_row_task, client=client)
+                task_iter = pool_context.map(worker_func, tasks)
+
+            for n, res_dict in enumerate(task_iter, start=1):
+                status = res_dict["status"]
+                row_id = res_dict["idx"]
+                loan_no = res_dict["loan_no"]
+                sanitized = res_dict.get("sanitized", "")
+                stats["api_calls"] += res_dict.get("api_calls", 0)
+                stats["cache_hits"] += res_dict.get("cache_hits", 0)
+
+                if status == "INVALID_INPUT":
+                    consecutive_api = consecutive_internal = 0
+                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: invalid/empty address")
+                    row = res_dict["row"]
+                elif status == "CACHE_MISS":
+                    skipped_cache += 1
+                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: not in cache, skipped (--cache-only)")
+                    continue
+                elif status == "TRANSIENT_API_ERROR":
+                    skipped_api += 1
+                    consecutive_api += 1
+                    err_msg = res_dict.get("error", "API error")
+                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: API trouble ({err_msg}); "
+                          f"row not saved, it will be retried next run")
+                    if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
+                        raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
+                                       f"errors (last: {err_msg}). Stopping; progress is saved in PostgreSQL.")
+                    continue
+                elif status == "API_ABORT":
+                    err_msg = res_dict.get("error", "API abort")
+                    raise ApiAbort(f"API aborted: {err_msg}")
+                elif status == "INTERNAL_ERROR":
+                    consecutive_internal += 1
+                    err_msg = res_dict.get("error", "Internal error")
+                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: INTERNAL ERROR {err_msg}")
+                    row = res_dict["row"]
+                    if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
+                        batch.append(row)
+                        raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                else:  # status == "OK"
+                    consecutive_api = consecutive_internal = 0
+                    res = res_dict["res"]
+                    row = res_dict["row"]
+                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
+                          f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
+
+                categories[row["score_category"]] += 1
+                review += 1 if row["review_needed"] else 0
+                batch.append(row)
+                if len(batch) >= args.batch_size:
+                    flush_db()
+                    print(f"   [saved {saved_total} rows so far to PostgreSQL ({db_schema}.{output_table})]")
+
+                if args.max_api_calls is not None and stats["api_calls"] >= args.max_api_calls:
+                    raise ApiAbort(f"--max-api-calls budget of {args.max_api_calls} reached")
+
+        except ApiAbort as e:
+            print(f"\nSTOPPED: {e}")
+            exit_code = 1
+        except KeyboardInterrupt:
+            print("\nInterrupted; saving what is done to PostgreSQL.")
+            exit_code = 130
+        finally:
+            if pool_context is not None:
+                if effective_mode == "process":
+                    pool_context.terminate()
+                    pool_context.join()
+                else:
+                    pool_context.shutdown(wait=False, cancel_futures=True)
+            flush_db()
+            cur.close()
+            conn.close()
+            if cache is not None:
+                cache.close()
 
     print(f"\nDone. {saved_total} rows written to PostgreSQL -> {db_schema}.{output_table}")
     if categories:
@@ -2267,6 +2549,10 @@ def parse_arguments(argv=None):
     p.add_argument("--random", "-r", action="store_true", help="Sample N random rows instead of first N sequential rows")
     p.add_argument("--seed", type=int, default=None, help="Random seed for reproducible sampling (e.g. --seed 42)")
     p.add_argument("--batch-size", "-b", type=int, default=20, help="Rows per save to CSV / PostgreSQL (default: 20)")
+    p.add_argument("--workers", "-w", type=int, default=1,
+                   help="Number of concurrent workers (default: 1; >1 enables multiprocessing)")
+    p.add_argument("--worker-mode", choices=["process", "thread"], default="process",
+                   help="Concurrency backend: 'process' (multiprocessing, default) or 'thread' (multithreading)")
     p.add_argument("--region", default="in", help="Region bias for Google (default: in)")
     p.add_argument("--cache-db", default=DEFAULT_CACHE_DB, help=f"SQLite cache file (default: {DEFAULT_CACHE_DB})")
     p.add_argument("--no-cache", action="store_true", help="Disable the cache (every address hits the APIs)")
@@ -2452,74 +2738,183 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
             saved_total += len(batch)
             batch.clear()
 
-    try:
-        for n, idx in enumerate(todo, start=1):
-            loan_no = loans[idx]
-            original = addresses[idx]
-            sanitized, san_flags = sanitize_address(original)
+    workers = getattr(args, "workers", 1) or 1
+    worker_mode = getattr(args, "worker_mode", "process") or "process"
+    if workers < 1:
+        workers = 1
 
-            if not sanitized:
-                res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
-                                    category="INVALID_INPUT")
-                print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: invalid/empty address")
-            else:
-                ckey = _normalize(sanitized)
-                if ckey in memo:
-                    res = memo[ckey]
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: duplicate address -> reused")
+    if workers == 1:
+        try:
+            for n, idx in enumerate(todo, start=1):
+                loan_no = loans[idx]
+                original = addresses[idx]
+                sanitized, san_flags = sanitize_address(original)
+
+                if not sanitized:
+                    res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
+                                        category="INVALID_INPUT")
+                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: invalid/empty address")
                 else:
-                    try:
-                        res = derive_coordinates_with_confidence(sanitized, client)
-                    except CacheMiss:
-                        skipped_cache += 1
-                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: not in cache, skipped (--cache-only)")
-                        continue
-                    except TransientApiError as e:
-                        skipped_api += 1
-                        consecutive_api += 1
-                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: API trouble ({e}); "
-                              f"row not saved, it will be retried next run")
-                        if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
-                            raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
-                                           f"errors (last: {e}). Stopping; progress is saved.")
-                        continue
-                    except (ApiAbort, KeyboardInterrupt):
-                        raise
-                    except Exception as e:            # a bug or odd data in ONE row must not kill the run
-                        consecutive_internal += 1
-                        msg = getattr(client, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
-                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: INTERNAL ERROR {msg}")
-                        traceback.print_exc(limit=3)
-                        res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
-                                            category="ERROR", flags=[ERROR_DERIVATION])
-                        if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
-                            batch.append(build_row(idx, loan_no, address_col, original, sanitized, res, san_flags))
-                            raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                    ckey = _normalize(sanitized)
+                    if ckey in memo:
+                        res = memo[ckey]
+                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: duplicate address -> reused")
                     else:
-                        consecutive_api = consecutive_internal = 0
-                        memo[ckey] = res
-                        time.sleep(REQUEST_PAUSE_S)
-                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
-                              f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
+                        try:
+                            res = derive_coordinates_with_confidence(sanitized, client)
+                        except CacheMiss:
+                            skipped_cache += 1
+                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: not in cache, skipped (--cache-only)")
+                            continue
+                        except TransientApiError as e:
+                            skipped_api += 1
+                            consecutive_api += 1
+                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: API trouble ({e}); "
+                                  f"row not saved, it will be retried next run")
+                            if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
+                                raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
+                                               f"errors (last: {e}). Stopping; progress is saved.")
+                            continue
+                        except (ApiAbort, KeyboardInterrupt):
+                            raise
+                        except Exception as e:            # a bug or odd data in ONE row must not kill the run
+                            consecutive_internal += 1
+                            msg = getattr(client, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
+                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: INTERNAL ERROR {msg}")
+                            traceback.print_exc(limit=3)
+                            res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
+                                                category="ERROR", flags=[ERROR_DERIVATION])
+                            if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
+                                batch.append(build_row(idx, loan_no, address_col, original, sanitized, res, san_flags))
+                                raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                        else:
+                            consecutive_api = consecutive_internal = 0
+                            memo[ckey] = res
+                            time.sleep(REQUEST_PAUSE_S)
+                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
+                                  f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
 
-            row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
-            categories[row["score_category"]] += 1
-            review += 1 if row["review_needed"] else 0
-            batch.append(row)
-            if len(batch) >= args.batch_size:
-                flush()
-                print(f"   [saved {saved_total} rows so far]")
+                row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
+                categories[row["score_category"]] += 1
+                review += 1 if row["review_needed"] else 0
+                batch.append(row)
+                if len(batch) >= args.batch_size:
+                    flush()
+                    print(f"   [saved {saved_total} rows so far]")
 
-    except ApiAbort as e:
-        print(f"\nSTOPPED: {e}")
-        exit_code = 1
-    except KeyboardInterrupt:
-        print("\nInterrupted; saving what is done.")
-        exit_code = 130
-    finally:
-        flush()
-        if cache is not None:
-            cache.close()
+        except ApiAbort as e:
+            print(f"\nSTOPPED: {e}")
+            exit_code = 1
+        except KeyboardInterrupt:
+            print("\nInterrupted; saving what is done.")
+            exit_code = 130
+        finally:
+            flush()
+            if cache is not None:
+                cache.close()
+    else:
+        effective_mode = worker_mode
+        if client_factory is not None and effective_mode == "process":
+            effective_mode = "thread"
+
+        print(f"Running with {workers} concurrent workers (mode: {effective_mode})")
+        tasks = [(idx, loans[idx], address_col, addresses[idx]) for idx in todo]
+
+        pool_context = None
+        try:
+            if effective_mode == "process":
+                init_args = (
+                    api_key,
+                    args.region,
+                    args.cache_db,
+                    args.no_cache,
+                    args.cache_only,
+                    args.cache_max_age_days,
+                    args.max_api_calls,
+                    False,
+                    None,
+                )
+                pool_context = multiprocessing.Pool(
+                    processes=workers,
+                    initializer=_init_worker_process,
+                    initargs=init_args,
+                )
+                task_iter = pool_context.imap(_process_row_task, tasks, chunksize=1)
+            else:
+                pool_context = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                worker_func = functools.partial(_process_row_task, client=client)
+                task_iter = pool_context.map(worker_func, tasks)
+
+            for n, res_dict in enumerate(task_iter, start=1):
+                status = res_dict["status"]
+                idx = res_dict["idx"]
+                loan_no = res_dict["loan_no"]
+                sanitized = res_dict.get("sanitized", "")
+                stats["api_calls"] += res_dict.get("api_calls", 0)
+                stats["cache_hits"] += res_dict.get("cache_hits", 0)
+
+                if status == "INVALID_INPUT":
+                    consecutive_api = consecutive_internal = 0
+                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: invalid/empty address")
+                    row = res_dict["row"]
+                elif status == "CACHE_MISS":
+                    skipped_cache += 1
+                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: not in cache, skipped (--cache-only)")
+                    continue
+                elif status == "TRANSIENT_API_ERROR":
+                    skipped_api += 1
+                    consecutive_api += 1
+                    err_msg = res_dict.get("error", "API error")
+                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: API trouble ({err_msg}); "
+                          f"row not saved, it will be retried next run")
+                    if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
+                        raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
+                                       f"errors (last: {err_msg}). Stopping; progress is saved.")
+                    continue
+                elif status == "API_ABORT":
+                    err_msg = res_dict.get("error", "API abort")
+                    raise ApiAbort(f"API aborted: {err_msg}")
+                elif status == "INTERNAL_ERROR":
+                    consecutive_internal += 1
+                    err_msg = res_dict.get("error", "Internal error")
+                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: INTERNAL ERROR {err_msg}")
+                    row = res_dict["row"]
+                    if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
+                        batch.append(row)
+                        raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                else:  # status == "OK"
+                    consecutive_api = consecutive_internal = 0
+                    res = res_dict["res"]
+                    row = res_dict["row"]
+                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
+                          f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
+
+                categories[row["score_category"]] += 1
+                review += 1 if row["review_needed"] else 0
+                batch.append(row)
+                if len(batch) >= args.batch_size:
+                    flush()
+                    print(f"   [saved {saved_total} rows so far]")
+
+                if args.max_api_calls is not None and stats["api_calls"] >= args.max_api_calls:
+                    raise ApiAbort(f"--max-api-calls budget of {args.max_api_calls} reached")
+
+        except ApiAbort as e:
+            print(f"\nSTOPPED: {e}")
+            exit_code = 1
+        except KeyboardInterrupt:
+            print("\nInterrupted; saving what is done.")
+            exit_code = 130
+        finally:
+            if pool_context is not None:
+                if effective_mode == "process":
+                    pool_context.terminate()
+                    pool_context.join()
+                else:
+                    pool_context.shutdown(wait=False, cancel_futures=True)
+            flush()
+            if cache is not None:
+                cache.close()
 
     print(f"\nDone. {saved_total} rows written this run -> {output_csv}")
     if categories:

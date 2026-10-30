@@ -200,6 +200,21 @@ python geocode_valid_addresses_v2.py --input GEOCODING.csv --limit 20 --random -
 python geocode_valid_addresses_v2.py --db --limit 20 --random
 ```
 
+#### High-Performance Multiprocessing / Parallel Execution:
+```bash
+# Process CSV with 4 concurrent worker processes (multiprocessing pool):
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 4
+
+# Run 8 concurrent worker processes in PostgreSQL Database mode:
+python geocode_valid_addresses_v2.py --db --workers 8
+
+# Short flag (-w) with custom batch size:
+python geocode_valid_addresses_v2.py --input GEOCODING.csv -w 4 --batch-size 50
+
+# Concurrency backend ('process' multiprocessing, default; or 'thread' multithreading):
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --workers 4 --worker-mode process
+```
+
 #### Run in CSV Mode:
 ```bash
 python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --batch-size 20
@@ -223,7 +238,7 @@ Run the offline test suite (no network or API key required):
 ```bash
 pytest test_geocode_v2.py -v
 ```
-**Results**: 100 tests passing in ~4.2 seconds.
+**Results**: 106 tests passing in ~7.8 seconds.
 
 ---
 
