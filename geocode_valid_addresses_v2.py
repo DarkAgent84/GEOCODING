@@ -2394,7 +2394,7 @@ def _run_db(args, api_key, client_factory) -> int:
         return 0
 
     cache = None
-    if not args.no_cache:
+    if not args.no_cache and not getattr(args, "no_api", False):
         try:        # the cache gets its OWN connection so worker threads never touch the batch transaction
             cache_conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user,
                                           password=db_password, connect_timeout=10)
@@ -2405,7 +2405,9 @@ def _run_db(args, api_key, client_factory) -> int:
             return 1
         cache = PostgresCache(cache_conn, db_schema, args.cache_table, args.cache_max_age_days, owns_conn=True)
         print(f"Using PostgreSQL cache table: {db_schema}.{args.cache_table}")
-    if client_factory is not None:
+    if getattr(args, "no_api", False):
+        client = None
+    elif client_factory is not None:
         client = client_factory(args, cache)
     else:
         client = ApiClient(api_key, cache, region=args.region, cache_only=args.cache_only,
@@ -2432,7 +2434,8 @@ def _run_db(args, api_key, client_factory) -> int:
     try:
         execute_rows(rows, address_col, client, args.workers, batch, flush_db, args.batch_size, tally,
                      show_id=lambda k: k,
-                     saved_note=lambda: f"   [saved {tally.saved} rows so far to PostgreSQL ({db_schema}.{output_table})]")
+                     saved_note=lambda: f"   [saved {tally.saved} rows so far to PostgreSQL ({db_schema}.{output_table})]",
+                     no_api=getattr(args, 'no_api', False))
     except ApiAbort as e:
         print(f"\nSTOPPED: {e}")
         exit_code = 1
@@ -2660,10 +2663,12 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
 
     # ---- client ------------------------------------------------------------
     cache = None
-    if not args.no_cache:
+    if not args.no_cache and not getattr(args, "no_api", False):
         cache = DiskCache(args.cache_db, args.cache_max_age_days)
         print(f"Using disk cache: {args.cache_db}")
-    if client_factory is not None:
+    if getattr(args, "no_api", False):
+        client = None
+    elif client_factory is not None:
         client = client_factory(args, cache)
     else:
         client = ApiClient(api_key, cache, region=args.region, cache_only=args.cache_only,
