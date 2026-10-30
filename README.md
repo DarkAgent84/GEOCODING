@@ -183,6 +183,19 @@ GOOGLE_API_KEY=your_google_maps_api_key
 
 ### 3. Usage Commands
 
+#### Offline Pre-API Validation Mode (Zero API Calls, Complete Dataset Analysis):
+Run through all addresses to detect and classify incomplete addresses, conflicting PIN codes, spelling mistakes, and synonym normalization WITHOUT making any Google API calls and without needing an API key:
+```bash
+# Process entire CSV offline with 4 concurrent workers (zero API calls, zero cost):
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_pre_api.csv --no-api --workers 4
+
+# Aliases supported (--pre-api-only / --validate-only):
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --pre-api-only -w 8
+
+# Run in PostgreSQL Database mode offline without API calls:
+python geocode_valid_addresses_v2.py --db --no-api
+```
+
 #### Dry Run (Pre-validation & Cost Analysis without API Calls):
 ```bash
 python geocode_valid_addresses_v2.py --input GEOCODING.csv --dry-run
@@ -238,7 +251,7 @@ Run the offline test suite (no network or API key required):
 ```bash
 pytest test_geocode_v2.py -v
 ```
-**Results**: 106 tests passing in ~7.8 seconds.
+**Results**: 108 tests passing in ~7.9 seconds.
 
 ---
 

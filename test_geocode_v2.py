@@ -1053,3 +1053,75 @@ def test_real_multiprocessing_pool_with_sqlite_cache(tmp_path):
     assert rows[1]["derivation_type"] == "INVALID_INPUT"
     assert rows[2]["confidence_score"] == "100"
 
+def test_no_api_mode_csv_e2e(tmp_path):
+    in_csv = str(tmp_path / "in.csv")
+    out_csv = str(tmp_path / "out.csv")
+    rows = [
+        ("L1", "PLOT 12 NEAR SHIV MANDIR BANGALORE 560001"),
+        ("L2", ""),
+        ("L3", "FLAT 101 MG ROAD"),
+        ("L4", "PLOT 12 NEAR STATION ROAD PUNE 411001 MUMBAI 400001"),
+        ("L5", "NIRMAN BHAWAN BENGALUR 560001"),
+        ("L6", "WARD NO 17 UMARIYA ROAD KHITOLA BASTI SIHORA 483225"),
+    ]
+    with open(in_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["soa_loan_no", "soa_current_address"])
+        w.writerows(rows)
+
+    code = v2.main(["-i", in_csv, "-o", out_csv, "--no-api"])
+    assert code == 0
+    res_rows = read_out(out_csv)
+    assert len(res_rows) == 6
+
+    # L1: Synonym Normalized
+    assert res_rows[0]["score_category"] == "SYNONYM_NORMALIZED"
+    assert res_rows[0]["confidence_score"] == "60"
+    assert res_rows[0]["geocoding_api_called"] == "NO"
+    assert res_rows[0]["places_api_called"] == "NO"
+    assert res_rows[0]["latitude"] == ""
+
+    # L2: Empty / Invalid
+    assert res_rows[1]["score_category"] == "INVALID_INPUT"
+
+    # L3: Incomplete
+    assert res_rows[2]["score_category"] == "INCOMPLETE_ADDRESS"
+    assert res_rows[2]["address_completeness_status"] == "INCOMPLETE"
+
+    # L4: Conflicting pincodes
+    assert res_rows[3]["score_category"] == "DOUBLE_PINCODE"
+
+    # L5: Spelling error
+    assert res_rows[4]["score_category"] == "SPELLING_MISTAKE"
+    assert res_rows[4]["spelling_error_detected"] == "YES"
+
+    # L6: Clean complete
+    assert res_rows[5]["score_category"] == "VALID_ADDRESS"
+    assert res_rows[5]["confidence_score"] == "70"
+    assert res_rows[5]["address_completeness_status"] == "COMPLETE"
+    assert res_rows[5]["review_needed"] == "NO"
+
+
+def test_no_api_mode_with_multiprocessing(tmp_path):
+    in_csv = str(tmp_path / "in.csv")
+    out_csv = str(tmp_path / "out.csv")
+    rows = [
+        ("L1", "PLOT 12 NEAR SHIV MANDIR BANGALORE 560001"),
+        ("L2", ""),
+        ("L3", "FLAT 101 MG ROAD"),
+        ("L4", "PLOT 12 NEAR STATION ROAD PUNE 411001 MUMBAI 400001"),
+    ]
+    with open(in_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["soa_loan_no", "soa_current_address"])
+        w.writerows(rows)
+
+    code = v2.main(["-i", in_csv, "-o", out_csv, "--no-api", "--workers", "2", "--worker-mode", "thread"])
+    assert code == 0
+    res_rows = read_out(out_csv)
+    assert len(res_rows) == 4
+    assert res_rows[0]["score_category"] == "SYNONYM_NORMALIZED"
+    assert res_rows[1]["score_category"] == "INVALID_INPUT"
+    assert res_rows[2]["score_category"] == "INCOMPLETE_ADDRESS"
+    assert res_rows[3]["score_category"] == "DOUBLE_PINCODE"
+

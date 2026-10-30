@@ -1218,7 +1218,7 @@ def spelling_variants(ctx: AddrCtx, formatted_address: str, limit: int = 3):
     return out[:limit]
 
 
-def derive_coordinates_with_confidence(address: str, client) -> dict:
+def derive_coordinates_with_confidence(address: str, client=None, no_api: bool = False) -> dict:
     """
     6-stage cost-optimized address validation, classification & geocoding pipeline:
       Stage 1: Incomplete Address Detection (score 0-9, NO API calls)
@@ -1228,10 +1228,10 @@ def derive_coordinates_with_confidence(address: str, client) -> dict:
       Stage 5: Google Geocoding & Places Fallback (POI exact 90-99, Landmark 70-80)
       Stage 6: Strict Exact Match (ROOFTOP + partial_match=False + verified -> 100)
     """
-    return _derive_core(address, client)
+    return _derive_core(address, client, no_api=no_api)
 
 
-def _derive_core(address: str, client) -> dict:
+def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
     """Execute the 6-stage sequential validation, normalization & geocoding pipeline."""
     # Stage 1: Incomplete Address Detection (score 0-9, NO API calls)
     is_inc, subcat, fails, major_words, pins = check_address_completeness(address)
@@ -1354,9 +1354,32 @@ def _derive_core(address: str, client) -> dict:
         "spelling_error_detected": is_uncertain,
         "suspected_misspelled_words": ", ".join(suspected) if is_uncertain else "",
         "suggested_spelling_corrections": ", ".join(suggestions) if is_uncertain else "",
-        "geocoding_api_called": True,
+        "geocoding_api_called": not no_api,
         "places_api_called": False,
     }
+
+    if no_api or client is None:
+        flags = []
+        if is_uncertain:
+            flags.append("SPELLING_UNCERTAIN")
+        if was_normalized:
+            flags.append("SYNONYM_NORMALIZED")
+        score = SCORE_SYNONYM_MAX if not was_normalized else SCORE_SYNONYM_MIN
+        cat = "SYNONYM_NORMALIZED" if was_normalized else "VALID_ADDRESS"
+        res = _blank_result(
+            status="PASSED_PRE_API",
+            source_api="VALIDATION_RULE",
+            derivation_type="OFFLINE_VALIDATION_PASSED",
+            category=cat,
+            match_classification="VALID_ADDRESS",
+            processing_stage="STAGE_4_SYNONYM_NORMALIZATION" if was_normalized else "STAGE_PRE_API_VALIDATION",
+            confidence_score=score,
+            recommended_geofence_m=geofence_for_score(score),
+            flags=flags,
+            verification="OFFLINE_PASSED",
+            **base_meta
+        )
+        return res
 
     # Stages 5 & 6: Proceed with Google Geocoding API using normalized address
     ctx = AddrCtx(norm_address)
@@ -1703,6 +1726,8 @@ def build_remarks(res: dict, flags) -> str:
         if place and res.get("place_reject"):
             parts.append(f"Places returned '{place}' but it was rejected: "
                          f"{_REJECT_TEXT.get(res['place_reject'], res['place_reject'])}.")
+    elif cat in ("VALID_ADDRESS", "SYNONYM_NORMALIZED"):
+        parts.append("Address passed offline validation (valid length, >=3 major words, valid 6-digit pincode, no spelling errors). Ready for Google API geocoding.")
     elif cat == "NOT_FOUND":
         parts.append("Google found no result for this address.")
     else:
@@ -1795,10 +1820,11 @@ def build_row(idx, loan_no, address_col, original, sanitized, res, extra_flags):
 # --------------------------------------------------------------------------
 _worker_client = None
 _worker_cache = None
+_worker_no_api = False
 
 
 def _init_worker_process(api_key, region, cache_db, no_cache, cache_only, max_age_days,
-                         max_api_calls=None, db_mode=False, db_config=None):
+                         max_api_calls=None, db_mode=False, db_config=None, no_api=False):
     """Initializer executed once by each worker process in multiprocessing.Pool."""
     global _worker_client, _worker_cache
     for stream in (sys.stdout, sys.stderr):
@@ -1837,11 +1863,15 @@ def _init_worker_process(api_key, region, cache_db, no_cache, cache_only, max_ag
                 cache = None
 
     _worker_cache = cache
-    _worker_client = ApiClient(api_key, cache, region=region, cache_only=cache_only,
-                               max_api_calls=max_api_calls)
+    _worker_no_api = no_api
+    if no_api:
+        _worker_client = None
+    else:
+        _worker_client = ApiClient(api_key, cache, region=region, cache_only=cache_only,
+                                   max_api_calls=max_api_calls)
 
 
-def _process_row_task(task: tuple, client=None) -> dict:
+def _process_row_task(task: tuple, client=None, no_api=False) -> dict:
     """
     Worker task executing sanitize_address, Stage 1-4 checks, Stage 5-6 geocoding/places,
     and row construction.
@@ -1850,6 +1880,7 @@ def _process_row_task(task: tuple, client=None) -> dict:
     """
     idx, loan_no, address_col, original = task
     sanitized, san_flags = sanitize_address(original)
+    is_no_api = no_api or _worker_no_api
 
     if not sanitized:
         res = _blank_result(
@@ -1860,6 +1891,20 @@ def _process_row_task(task: tuple, client=None) -> dict:
         row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
         return {
             "status": "INVALID_INPUT",
+            "idx": idx,
+            "loan_no": loan_no,
+            "sanitized": sanitized,
+            "res": res,
+            "row": row,
+            "api_calls": 0,
+            "cache_hits": 0,
+        }
+
+    if is_no_api:
+        res = derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
+        row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
+        return {
+            "status": "OK",
             "idx": idx,
             "loan_no": loan_no,
             "sanitized": sanitized,
@@ -2303,11 +2348,13 @@ def _run_db(args, api_key, client_factory) -> int:
         return 0
 
     cache = None
-    if not args.no_cache:
+    if not args.no_cache and not args.no_api:
         cache = PostgresCache(conn, db_schema, args.cache_table, args.cache_max_age_days)
         print(f"Using PostgreSQL cache table: {db_schema}.{args.cache_table}")
     if client_factory is not None:
         client = client_factory(args, cache)
+    elif args.no_api:
+        client = None
     else:
         client = ApiClient(api_key, cache, region=args.region, cache_only=args.cache_only,
                            max_api_calls=args.max_api_calls)
@@ -2354,6 +2401,11 @@ def _run_db(args, api_key, client_factory) -> int:
                     if ckey in memo:
                         res = memo[ckey]
                         print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: duplicate address -> reused")
+                    elif args.no_api:
+                        res = derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
+                        memo[ckey] = res
+                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
+                              f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
                     else:
                         try:
                             res = derive_coordinates_with_confidence(sanitized, client)
@@ -2439,6 +2491,7 @@ def _run_db(args, api_key, client_factory) -> int:
                     args.max_api_calls,
                     True,
                     db_config,
+                    args.no_api,
                 )
                 pool_context = multiprocessing.Pool(
                     processes=workers,
@@ -2448,7 +2501,7 @@ def _run_db(args, api_key, client_factory) -> int:
                 task_iter = pool_context.imap(_process_row_task, tasks, chunksize=1)
             else:
                 pool_context = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-                worker_func = functools.partial(_process_row_task, client=client)
+                worker_func = functools.partial(_process_row_task, client=client, no_api=args.no_api)
                 task_iter = pool_context.map(worker_func, tasks)
 
             for n, res_dict in enumerate(task_iter, start=1):
@@ -2533,6 +2586,20 @@ def _run_db(args, api_key, client_factory) -> int:
     if skipped_cache:
         print(f"Skipped because they are not in the cache (--cache-only): {skipped_cache}")
     print(f"API calls made: {stats.get('api_calls', 0)} | served from disk cache: {stats.get('cache_hits', 0)}")
+    if getattr(args, "no_api", False):
+        valid_cnt = categories.get("VALID_ADDRESS", 0) + categories.get("SYNONYM_NORMALIZED", 0)
+        print("\n=== Pre-API Detection Summary ===")
+        print(f"Total Rows Processed: {saved_total}")
+        print(f"  * Valid Addresses (Ready for API): {valid_cnt}")
+        print(f"    - Clean Complete: {categories.get('VALID_ADDRESS', 0)}")
+        print(f"    - Synonym Normalized: {categories.get('SYNONYM_NORMALIZED', 0)}")
+        print(f"  * Flagged / Pre-API Issues (No API Needed):")
+        print(f"    - Incomplete Address (Stage 1): {categories.get('INCOMPLETE_ADDRESS', 0)}")
+        print(f"    - Conflicting PIN Codes (Stage 2): {categories.get('DOUBLE_PINCODE', 0)}")
+        print(f"    - Spelling Errors (Stage 3): {categories.get('SPELLING_MISTAKE', 0) + categories.get('SPELLING_ERROR', 0)}")
+        print(f"    - Empty / Invalid Input: {categories.get('INVALID_INPUT', 0)}")
+        print(f"Total Flagged for Review: {review}")
+        print("=================================\n")
     return exit_code
 
 
@@ -2549,6 +2616,10 @@ def parse_arguments(argv=None):
     p.add_argument("--random", "-r", action="store_true", help="Sample N random rows instead of first N sequential rows")
     p.add_argument("--seed", type=int, default=None, help="Random seed for reproducible sampling (e.g. --seed 42)")
     p.add_argument("--batch-size", "-b", type=int, default=20, help="Rows per save to CSV / PostgreSQL (default: 20)")
+    p.add_argument("--no-api", "--pre-api-only", "--validate-only",
+                   dest="no_api", action="store_true",
+                   help="Run all pre-API validation stages (Stage 1 Incomplete, Stage 2 Conflicting PINs, "
+                        "Stage 3 Spelling, Stage 4 Synonym) across all rows without making any Google API calls.")
     p.add_argument("--workers", "-w", type=int, default=1,
                    help="Number of concurrent workers (default: 1; >1 enables multiprocessing)")
     p.add_argument("--worker-mode", choices=["process", "thread"], default="process",
@@ -2610,7 +2681,7 @@ def main(argv=None, client_factory=None) -> int:
     # Database Mode
     if args.db or (args.input and args.input.lower() in ("db", "database", "postgres")):
         api_key = os.environ.get(API_KEY_ENV, "").strip()
-        if client_factory is None and not args.cache_only and not args.dry_run and not api_key:
+        if client_factory is None and not args.cache_only and not args.dry_run and not args.no_api and not api_key:
             print(f"Error: set the {API_KEY_ENV} environment variable (or use --cache-only / --dry-run).")
             return 2
         return _run_db(args, api_key, client_factory)
@@ -2645,7 +2716,7 @@ def main(argv=None, client_factory=None) -> int:
 
     # ---- API key ----------------------------------------------------------
     api_key = os.environ.get(API_KEY_ENV, "").strip()
-    if client_factory is None and not args.cache_only and not api_key:
+    if client_factory is None and not args.cache_only and not args.no_api and not api_key:
         print(f"Error: set the {API_KEY_ENV} environment variable (or use --cache-only / --dry-run).")
         return 2
 
@@ -2706,11 +2777,13 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
 
     # ---- client ------------------------------------------------------------
     cache = None
-    if not args.no_cache:
+    if not args.no_cache and not args.no_api:
         cache = DiskCache(args.cache_db, args.cache_max_age_days)
         print(f"Using disk cache: {args.cache_db}")
     if client_factory is not None:
         client = client_factory(args, cache)
+    elif args.no_api:
+        client = None
     else:
         client = ApiClient(api_key, cache, region=args.region, cache_only=args.cache_only,
                            max_api_calls=args.max_api_calls)
@@ -2759,6 +2832,11 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
                     if ckey in memo:
                         res = memo[ckey]
                         print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: duplicate address -> reused")
+                    elif args.no_api:
+                        res = derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
+                        memo[ckey] = res
+                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
+                              f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
                     else:
                         try:
                             res = derive_coordinates_with_confidence(sanitized, client)
@@ -2833,6 +2911,7 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
                     args.max_api_calls,
                     False,
                     None,
+                    args.no_api,
                 )
                 pool_context = multiprocessing.Pool(
                     processes=workers,
@@ -2842,7 +2921,7 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
                 task_iter = pool_context.imap(_process_row_task, tasks, chunksize=1)
             else:
                 pool_context = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-                worker_func = functools.partial(_process_row_task, client=client)
+                worker_func = functools.partial(_process_row_task, client=client, no_api=args.no_api)
                 task_iter = pool_context.map(worker_func, tasks)
 
             for n, res_dict in enumerate(task_iter, start=1):
@@ -2925,6 +3004,20 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
     if skipped_cache:
         print(f"Skipped because they are not in the cache (--cache-only): {skipped_cache}")
     print(f"API calls made: {stats.get('api_calls', 0)} | served from disk cache: {stats.get('cache_hits', 0)}")
+    if getattr(args, "no_api", False):
+        valid_cnt = categories.get("VALID_ADDRESS", 0) + categories.get("SYNONYM_NORMALIZED", 0)
+        print("\n=== Pre-API Detection Summary ===")
+        print(f"Total Rows Processed: {saved_total}")
+        print(f"  * Valid Addresses (Ready for API): {valid_cnt}")
+        print(f"    - Clean Complete: {categories.get('VALID_ADDRESS', 0)}")
+        print(f"    - Synonym Normalized: {categories.get('SYNONYM_NORMALIZED', 0)}")
+        print(f"  * Flagged / Pre-API Issues (No API Needed):")
+        print(f"    - Incomplete Address (Stage 1): {categories.get('INCOMPLETE_ADDRESS', 0)}")
+        print(f"    - Conflicting PIN Codes (Stage 2): {categories.get('DOUBLE_PINCODE', 0)}")
+        print(f"    - Spelling Errors (Stage 3): {categories.get('SPELLING_MISTAKE', 0) + categories.get('SPELLING_ERROR', 0)}")
+        print(f"    - Empty / Invalid Input: {categories.get('INVALID_INPUT', 0)}")
+        print(f"Total Flagged for Review: {review}")
+        print("=================================\n")
     return exit_code
 
 
