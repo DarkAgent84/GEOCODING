@@ -42,7 +42,7 @@ Address Input
 1. **Stage 1: Incomplete Address Detection (Score 0–9 | 0 API Calls)**
    * Validates 3 strict completeness constraints:
      * Minimum 15 characters total length (`ADDRESS_TOO_SHORT`).
-     * More than 3 major words (`> 3`, i.e., $\ge 4$ words; $\le 3$ fails with `TOO_FEW_WORDS`).
+     * At least 3 major words ($\ge 3$ words; $< 3$ fails with `TOO_FEW_WORDS`).
      * Valid 6-digit Indian PIN code `[1-9]\d{5}` (`MISSING_PINCODE`).
    * Deeply categorized into subcategories with deterministic scoring within 0–9:
      * `ALL_CRITERIA_FAILED` (Score: 0)

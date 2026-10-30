@@ -626,8 +626,19 @@ def test_completeness_valid_address():
     assert is_inc is False
     assert subcat == "COMPLETE"
     assert fails == []
-    assert len(words) > 3
+    assert len(words) >= 3
     assert "600026" in pins
+
+
+def test_completeness_three_major_words_is_complete():
+    # Exactly 3 major words (BISHANPUR, IGLAS, ALIGARH) is now accepted as COMPLETE (>= 3)
+    addr = "BISHANPUR IGLAS ALIGARH - 202124"
+    is_inc, subcat, fails, words, pins = v2.check_address_completeness(addr)
+    assert is_inc is False
+    assert subcat == "COMPLETE"
+    assert fails == []
+    assert len(words) == 3
+    assert "202124" in pins
 
 
 def test_completeness_missing_pincode_deep_categorization():

@@ -138,7 +138,7 @@ SPELLING_UNCERTAIN_POLICY = "PROCEED"  # "PROCEED" allows uncertain to proceed t
 
 # Incomplete address detection constraints (3 constraints only)
 MIN_ADDRESS_CHARS = 15              # Constraint 1: minimum total characters
-MIN_MAJOR_WORDS = 3                 # Constraint 2: requires MORE than 3 major words (> 3, so <= 3 fails)
+MIN_MAJOR_WORDS = 3                 # Constraint 2: requires at least 3 major words (>= 3, so < 3 fails)
 STOPWORDS = {
     "the", "of", "and", "in", "at", "to", "for", "from",
     "near", "nr", "opp", "opposite", "behind", "beside",
@@ -254,12 +254,12 @@ def check_address_completeness(address: str, min_len: int = MIN_ADDRESS_CHARS, m
     """
     Incomplete address detection based strictly on 3 constraints:
       1. Total length of address >= min_len (default 15 characters)
-      2. Total more than 3 major words (> 3, i.e. >= 4 major words)
+      2. Total at least 3 major words (>= 3, i.e. < 3 fails)
       3. Pincode present and 6 numeric digits ([1-9]\\d{5})
 
     Deep categorization subcategories:
       - MISSING_PINCODE: only missing 6-digit pincode
-      - TOO_FEW_WORDS: only too few major words (<= 3)
+      - TOO_FEW_WORDS: only too few major words (< 3)
       - ADDRESS_TOO_SHORT: only length below min_len
       - TOO_SHORT_AND_FEW_WORDS: both too short and too few words
       - MISSING_PIN_AND_FEW_WORDS: missing pincode and too few words
@@ -277,7 +277,7 @@ def check_address_completeness(address: str, min_len: int = MIN_ADDRESS_CHARS, m
     fails = []
     if length < min_len:
         fails.append("ADDRESS_TOO_SHORT")
-    if len(major_words) <= min_words:
+    if len(major_words) < min_words:
         fails.append("TOO_FEW_WORDS")
     if not pins:
         fails.append("MISSING_PINCODE")
@@ -1633,7 +1633,7 @@ def build_remarks(res: dict, flags) -> str:
             if subcat == "MISSING_PINCODE":
                 parts.append("Incomplete address: missing 6-digit Indian postal pincode.")
             elif subcat == "TOO_FEW_WORDS":
-                parts.append(f"Incomplete address: only {cnt} major word(s){words_str}; requires more than 3 major words.")
+                parts.append(f"Incomplete address: only {cnt} major word(s){words_str}; requires at least 3 major words.")
             elif subcat == "ADDRESS_TOO_SHORT":
                 parts.append(f"Incomplete address: address length ({chars_cnt} characters) is below the minimum threshold (15 characters).")
             elif subcat == "TOO_SHORT_AND_FEW_WORDS":
