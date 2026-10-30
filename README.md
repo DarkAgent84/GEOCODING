@@ -145,7 +145,7 @@ The output CSV and PostgreSQL table `public.geocoding_processed` produce all req
 | `flags` | TEXT | Semicolon-delimited audit flags |
 | `review_needed` | BOOLEAN | `True` if human inspection is advised |
 | `remarks` | TEXT | Plain-language audit sentence |
-| `script_version` | TEXT | Script version identifier (`3.1`) |
+| `script_version` | TEXT | Script version identifier (`4.0`) |
 
 ---
 
@@ -224,8 +224,8 @@ python geocode_valid_addresses_v2.py --db --workers 8
 # Short flag (-w) with custom batch size:
 python geocode_valid_addresses_v2.py --input GEOCODING.csv -w 4 --batch-size 50
 
-# Concurrency backend ('process' multiprocessing, default; or 'thread' multithreading):
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --workers 4 --worker-mode process
+# Concurrency backend ('thread' multithreading, default; or 'process' multiprocessing):
+python geocode_valid_addresses_v2.py --input GEOCODING.csv --workers 4 --worker-mode thread
 ```
 
 #### Run in CSV Mode:

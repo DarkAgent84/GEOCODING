@@ -2,15 +2,23 @@
 """
 Geocode addresses, score how much each result can be trusted, and recommend a geofence radius.
 
+INCOMPLETE ADDRESS = exactly 3 constraints (Stage 1, no API call)
+  1. Total length       : the address must have at least MIN_ADDRESS_CHARS characters (15)
+  2. Major words        : at least MIN_MAJOR_WORDS (3) major words
+                          (a major word = 3+ characters, has a letter, not purely numeric, not a stopword)
+  3. Pincode            : a 6-digit numeric pincode must be present ([1-9]\\d{5})
+  An address that fails ANY of these is INCOMPLETE_ADDRESS (score 0-9) and is NOT sent to Google.
+  No other rule marks an address as incomplete.
+
 Pipeline per address
   1. Sanitize the text (strip junk, repeated phrases, stray tokens).
-  2. Google Geocoding API.  An exact rooftop match whose own address agrees with the input
-     (pincode / locality words) is accepted at once (score 100).
-  3. Otherwise Google Places Text Search, biased toward the geocoded point.  Each of the top
-     results is judged on its own: is it the address itself, or a landmark the address mentions
-     ("NEAR X", "OPP X")?  Is it in the right locality?  Is it only an area or a junction named
-     after the area?  Does it agree with the geocode?
-  4. The better of the geocode candidate and the best POI candidate wins.
+  Stage 1  Incomplete-address check (the 3 constraints above)           score 0-9,   no API
+  Stage 2  Two or more DIFFERENT pincodes                               score 12/15, no API
+  Stage 3  Offline spelling check against known place names             FLAG ONLY - the row still goes to the API
+  Stage 4  Synonym normalization (mandir -> temple, opp -> opposite), then Google Geocoding
+  Stage 5  Google Places Text Search (biased to the geocode); each result is judged on its own:
+           the address itself, a landmark the address mentions, or only an area / junction
+  Stage 6  An exact rooftop match whose own address agrees with the input scores 100 at once
 
 Score bands (the geofence radius follows the score)
   100      ROOFTOP_EXACT      exact rooftop, address verified                         -> 50 m
@@ -18,19 +26,17 @@ Score bands (the geofence radius follows the score)
   70-80    LANDMARK_EXACT     a named place the address says it is near/opposite      -> 250 m
   50       PARTIAL_MATCH      rooftop Google flagged partial_match, address verified  -> 250 m
   45       INTERPOLATED       street-level estimate, address verified                 -> 250 m
-  21-30    SPELLING_MISTAKE   a place whose name is a close misspelling of the        -> 1000 m
-                              address words (21 when it is only a landmark)
-  11-20    DOUBLE_PINCODE     the address holds two DIFFERENT pincodes. The text is    -> 1000 m
-                              left untouched; the score is held in this band, scaled
-                              by how good the underlying result was (11 = poor, 20 = exact)
-  10       INCOMPLETE_ADDRESS area / locality / street level, or no candidate trusted -> 1000 m
+  35       STREET_LEVEL       only the street was located                             -> 1000 m
+  21-30    SPELLING_MISTAKE   place name matched only through a misspelling           -> 1000 m
+  11-20    DOUBLE_PINCODE     address holds two or more different pincodes            -> 1000 m
+  10       AREA_LEVEL         area / locality level only, or no candidate trusted     -> 1000 m
+  0-9      INCOMPLETE_ADDRESS fails one or more of the 3 constraints (see above)      -> 1000 m (none at 0)
   0        NOT_FOUND / INVALID_INPUT                                                  -> none
-LANDMARK_EXACT is an addition to the original bands.  Set SCORE_LANDMARK to 90 below to fold it
-back into POI_EXACT.  Every row also gets a plain-language `remarks` column.
+Every row also gets a plain-language `remarks` column.
 
 Safety features
-  * API key comes from the GOOGLE_API_KEY environment variable only (never from the code), and is
-    redacted from every message and output cell.
+  * API key comes from the GOOGLE_API_KEY environment variable (or .env), never from the code, and
+    is redacted from every message and output cell.
   * Retries with exponential backoff and jitter; bad key / quota exhaustion stop the run cleanly.
   * Rows that failed only because of a network / quota problem are NOT written, so the next run
     retries them automatically.
@@ -39,40 +45,46 @@ Safety features
   * Persistent SQLite cache of raw API answers: re-running, resuming and changing the scoring cost
     no API calls.  --cache-only re-scores purely from the cache.
   * --max-api-calls puts a hard ceiling on spend for a run.
+  * --workers N runs N addresses at the same time (threads: the work is waiting on Google, so threads
+    give the same speed-up as processes while sharing one cache and one call budget).
+    --max-qps keeps the combined request rate under Google's limit however many workers there are.
+  * Identical addresses inside a run are sent to Google once and the result is reused.
 
 Usage examples
   export GOOGLE_API_KEY=...                       (Windows: set GOOGLE_API_KEY=...)
-  python geocode_valid_addresses_v2.py --input GEOCODING.csv --output out.csv --limit 20
-  python geocode_valid_addresses_v2.py --input GEOCODING.csv --output out.csv --dry-run
-  python geocode_valid_addresses_v2.py --input GEOCODING.csv --output rescored.csv --cache-only
+  python geocode_valid_addresses_v4.py --input GEOCODING.csv --output out.csv --limit 20
+  python geocode_valid_addresses_v4.py --input GEOCODING.csv --output out.csv --workers 8 --max-qps 20
+  python geocode_valid_addresses_v4.py --input GEOCODING.csv --output out.csv --sample 100 --seed 42
+  python geocode_valid_addresses_v4.py --input GEOCODING.csv --output out.csv --dry-run
+  python geocode_valid_addresses_v4.py --input GEOCODING.csv --output rescored.csv --cache-only
 """
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import csv
 import difflib
 import functools
 import json
 import math
-import multiprocessing
 import os
 import random
 import re
 import signal
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 import unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
 import requests
 
-SCRIPT_VERSION = "3.1"
+SCRIPT_VERSION = "4.0"
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -96,7 +108,8 @@ BACKOFF_BASE_S = 1.0
 BACKOFF_MAX_S = 30.0
 MAX_CONSECUTIVE_ERRORS = 5          # back-to-back rows lost to API trouble -> stop the run
 MAX_CONSECUTIVE_INTERNAL_ERRORS = 10
-REQUEST_PAUSE_S = 0.1
+DEFAULT_WORKERS = 4                 # addresses processed at the same time (--workers)
+DEFAULT_MAX_QPS = 10.0              # combined Google requests per second across all workers (0 = no limit)
 MAX_ADDRESS_CHARS = 300
 
 # Scores
@@ -110,10 +123,10 @@ SCORE_PARTIAL = 50
 SCORE_INTERPOLATED = 45
 SCORE_STREET = 35                   # Street-level geocode
 SCORE_AREA_LEVEL = 10               # Locality / area-level coarse geocode
+SCORE_INCOMPLETE = 10               # Post-API incomplete / unresolved fallback
 SCORE_SPELLING_MIN, SCORE_SPELLING_MAX = 21, 30   # close misspelling of a place name
 SCORE_LANDMARK_FUZZY = SCORE_SPELLING_MIN         # misspelled name, but only as a "near X" landmark
 SCORE_DOUBLE_PIN_MIN, SCORE_DOUBLE_PIN_MAX = 11, 20   # address contains two different pincodes
-SCORE_INCOMPLETE = 10               # Post-API incomplete / unresolved legacy fallback
 SCORE_INCOMPLETE_MIN, SCORE_INCOMPLETE_MAX = 0, 9     # Stage 1 incomplete address pre-API score band
 
 # Stage 1 subcategory scores (0-9)
@@ -131,16 +144,18 @@ INCOMPLETE_SUBCAT_SCORES = {
 SPELLING_SIMILARITY_MIN = 0.80      # mean word similarity needed for a "spelling mistake" match
 SINGLE_WORD_SPELLING_MIN = 0.90     # stricter when only one distinctive word is available
 MIN_TOKEN_SIMILARITY = 0.70         # every distinctive word must be at least this close
-MIN_MEANINGFUL_WORDS = 2            # fewer place words than this -> address too vague
 
 # Stage 3: Offline Spelling Validation Configuration
 SPELLING_ERROR_THRESHOLD = 0.82     # Ratio >= 0.82 to known name classified as SPELLING_ERROR
 SPELLING_UNCERTAIN_MIN = 0.75       # Ratio in [0.75, 0.82) classified as SPELLING_UNCERTAIN
+SPELLING_ERROR_POLICY = "STOP"      # "PROCEED": flag a suspected misspelling and STILL call the API;
+                                       # "STOP": old behaviour, stop at Stage 3 with score 21-30 and no API call
 SPELLING_UNCERTAIN_POLICY = "PROCEED"  # "PROCEED" allows uncertain to proceed to geocoding; "STOP" halts
 
-# Incomplete address detection constraints (3 constraints only)
-MIN_ADDRESS_CHARS = 15              # Constraint 1: minimum total characters
-MIN_MAJOR_WORDS = 3                 # Constraint 2: requires at least 3 major words (>= 3, so < 3 fails)
+# Incomplete address detection: EXACTLY these 3 constraints (Stage 1) and nothing else
+MIN_ADDRESS_CHARS = 15              # Constraint 1: total length must be >= this many characters
+MIN_MAJOR_WORDS = 3                 # Constraint 2: at least this many major words (fewer fails)
+# Constraint 3: a 6-digit numeric pincode must be present - see _pincodes() ([1-9]\d{5})
 STOPWORDS = {
     "the", "of", "and", "in", "at", "to", "for", "from",
     "near", "nr", "opp", "opposite", "behind", "beside",
@@ -771,10 +786,10 @@ class DiskCache:
 
     def __init__(self, path, max_age_days=DEFAULT_CACHE_MAX_AGE_DAYS):
         self.max_age_days = max_age_days if (max_age_days and max_age_days > 0) else None
-        self.conn = sqlite3.connect(path, timeout=60)
+        self.conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+        self._lock = threading.Lock()               # one connection shared by all worker threads
         try:
             self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA busy_timeout=60000")
         except sqlite3.DatabaseError:
             pass
         self.conn.execute(
@@ -783,12 +798,13 @@ class DiskCache:
         self.conn.commit()
 
     def get(self, key):
-        if self.max_age_days is None:
-            row = self.conn.execute("SELECT response FROM api_cache WHERE key=?", (key,)).fetchone()
-        else:
-            row = self.conn.execute(
-                "SELECT response FROM api_cache WHERE key=? AND saved_at >= datetime('now', ?)",
-                (key, f"-{int(self.max_age_days)} days")).fetchone()
+        with self._lock:
+            if self.max_age_days is None:
+                row = self.conn.execute("SELECT response FROM api_cache WHERE key=?", (key,)).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT response FROM api_cache WHERE key=? AND saved_at >= datetime('now', ?)",
+                    (key, f"-{int(self.max_age_days)} days")).fetchone()
         if not row:
             return None
         try:
@@ -797,12 +813,14 @@ class DiskCache:
             return None                      # corrupt row -> treat as a miss
 
     def set(self, key, data):
-        self.conn.execute("INSERT OR REPLACE INTO api_cache (key, response) VALUES (?, ?)",
-                          (key, json.dumps(data)))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("INSERT OR REPLACE INTO api_cache (key, response) VALUES (?, ?)",
+                              (key, json.dumps(data)))
+            self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
 
 # --------------------------------------------------------------------------
@@ -849,15 +867,21 @@ class ApiClient:
     """Cached, retrying client for the two Google endpoints."""
 
     def __init__(self, api_key, cache=None, region="in", cache_only=False, max_api_calls=None,
-                 session=None, sleep=time.sleep):
+                 session=None, sleep=time.sleep, max_qps=DEFAULT_MAX_QPS):
         self.api_key = api_key
         self.cache = cache
         self.region = region
         self.cache_only = cache_only
         self.max_api_calls = max_api_calls
-        self.session = session or requests.Session()
+        self._shared_session = session               # tests may inject one; otherwise one Session per thread
+        self._local = threading.local()
         self._sleep = sleep
         self.stats = {"api_calls": 0, "cache_hits": 0}
+        self._lock = threading.Lock()                # protects stats and the --max-api-calls budget
+        self._rate_lock = threading.Lock()
+        self._min_interval = (1.0 / max_qps) if (max_qps and max_qps > 0) else 0.0
+        self._next_slot = 0.0
+        self.stop_event = None                       # set by the run loop to make workers stop promptly
 
     # -- public -----------------------------------------------------------
     def geocode(self, address: str) -> dict:
@@ -888,6 +912,25 @@ class ApiClient:
             text = text.replace(self.api_key, "REDACTED")
         return re.sub(r"(key=)[^&\s'\"]+", r"\1REDACTED", text)
 
+    def _session(self):
+        if self._shared_session is not None:
+            return self._shared_session
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = self._local.session = requests.Session()
+        return sess
+
+    def _pace(self):
+        """Space real HTTP requests so ALL workers together stay under --max-qps."""
+        if not self._min_interval:
+            return
+        with self._rate_lock:
+            now = time.monotonic()
+            wait = self._next_slot - now
+            self._next_slot = max(now, self._next_slot) + self._min_interval
+        if wait > 0:
+            self._sleep(wait)
+
     def _backoff(self, attempt, extra=0.0):
         delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (2 ** attempt)) + extra
         self._sleep(delay + random.uniform(0, 0.5))
@@ -897,7 +940,8 @@ class ApiClient:
             for k in [key] + list(legacy_keys):
                 cached = self.cache.get(k)
                 if cached is not None:
-                    self.stats["cache_hits"] += 1
+                    with self._lock:
+                        self.stats["cache_hits"] += 1
                     return cached
         if self.cache_only:
             raise CacheMiss(key)
@@ -907,11 +951,15 @@ class ApiClient:
         full = dict(params, key=self.api_key)
         last_error = "unknown error"
         for attempt in range(MAX_RETRIES):
-            if self.max_api_calls is not None and self.stats["api_calls"] >= self.max_api_calls:
-                raise ApiAbort(f"--max-api-calls budget of {self.max_api_calls} reached")
-            self.stats["api_calls"] += 1
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise ApiAbort("run is stopping")
+            with self._lock:                         # check + count atomically so workers cannot overshoot
+                if self.max_api_calls is not None and self.stats["api_calls"] >= self.max_api_calls:
+                    raise ApiAbort(f"--max-api-calls budget of {self.max_api_calls} reached")
+                self.stats["api_calls"] += 1
+            self._pace()
             try:
-                resp = self.session.get(url, params=full, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S))
+                resp = self._session().get(url, params=full, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S))
             except requests.exceptions.RequestException as e:
                 last_error = f"{type(e).__name__}: {self._redact(e)}"
                 self._backoff(attempt)
@@ -1223,7 +1271,7 @@ def derive_coordinates_with_confidence(address: str, client=None, no_api: bool =
     6-stage cost-optimized address validation, classification & geocoding pipeline:
       Stage 1: Incomplete Address Detection (score 0-9, NO API calls)
       Stage 2: Duplicate / Conflicting PIN Code Detection (score 11-20, NO API calls)
-      Stage 3: Offline Spelling Mistake Detection (score 21-30, NO API calls)
+      Stage 3: Offline Spelling Mistake Detection (flag only; processing CONTINUES to the API)
       Stage 4: Synonym & Entity Normalization (score 60-70 preprocessing, CONTINUE to API)
       Stage 5: Google Geocoding & Places Fallback (POI exact 90-99, Landmark 70-80)
       Stage 6: Strict Exact Match (ROOFTOP + partial_match=False + verified -> 100)
@@ -1302,9 +1350,11 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
         )
         return res
 
-    # Stage 3: Offline Spelling Mistake Detection (score 21-30, NO API calls)
+    # Stage 3: Offline Spelling Mistake Detection. By default it only FLAGS the row and the address still
+    # goes to Google (SPELLING_ERROR_POLICY = "STOP" restores the old stop-without-API behaviour).
     has_spelling_err, suspected, suggestions, is_uncertain, spell_score = detect_spelling_errors(address)
-    if has_spelling_err or (is_uncertain and SPELLING_UNCERTAIN_POLICY == "STOP"):
+    if (has_spelling_err and SPELLING_ERROR_POLICY == "STOP") or \
+            (is_uncertain and SPELLING_UNCERTAIN_POLICY == "STOP"):
         spell_cat = "SPELLING_ERROR" if has_spelling_err else "SPELLING_UNCERTAIN"
         flags = [spell_cat]
         res = _blank_result(
@@ -1351,9 +1401,9 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
         "normalized_address": norm_address,
         "synonym_normalization_applied": was_normalized,
         "normalized_terms": synonym_terms_str,
-        "spelling_error_detected": is_uncertain,
-        "suspected_misspelled_words": ", ".join(suspected) if is_uncertain else "",
-        "suggested_spelling_corrections": ", ".join(suggestions) if is_uncertain else "",
+        "spelling_error_detected": bool(has_spelling_err or is_uncertain),
+        "suspected_misspelled_words": ", ".join(suspected) if (has_spelling_err or is_uncertain) else "",
+        "suggested_spelling_corrections": ", ".join(suggestions) if (has_spelling_err or is_uncertain) else "",
         "geocoding_api_called": not no_api,
         "places_api_called": False,
     }
@@ -1387,7 +1437,9 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
     ver = verify_geocode(ctx, g)
     g_score, g_cat = geocode_score(g)
     flags: list = []
-    if is_uncertain:
+    if has_spelling_err:
+        flags.append("SPELLING_ERROR")
+    elif is_uncertain:
         flags.append("SPELLING_UNCERTAIN")
 
     # Fast path: Stage 6 - Strict Exact Match (ROOFTOP + partial_match=False + verified -> 100)
@@ -1446,9 +1498,9 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
             if (cat == "POI_EXACT" and not set(_expand(r.get("name", "")).split()) <= (COMMON_DEITY_WORDS | POI_GENERIC_WORDS)
                     and sum(1 for x in results if _normalize(x.get("name", "")) == name_norm) == 1):
                 score += 5
-        if trusted and d is not None and cat != "INCOMPLETE_ADDRESS":
+        if trusted and d is not None and cat != "AREA_LEVEL":
             if d > FAR_LIMIT_M.get(lt, FAR_DEFAULT_M):
-                score, cat, ev.reason = SCORE_AREA_LEVEL, "INCOMPLETE_ADDRESS", "FAR_FROM_GEOCODE"
+                score, cat, ev.reason = SCORE_AREA_LEVEL, "AREA_LEVEL", "FAR_FROM_GEOCODE"
             elif lt in PRECISE_GEOCODE_TYPES and ver["status"] == "MATCH" \
                     and d > DISAGREE_CAP_M and score > SCORE_PARTIAL:
                 score = SCORE_PARTIAL
@@ -1502,18 +1554,12 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
         flags.extend(f for f in best["flags"] if f not in flags)
         if best["cat"] == "SPELLING_MISTAKE":
             res["typos"] = best["ev"].typos            # noted in remarks even if the geocode won
-        elif best["cat"] == "INCOMPLETE_ADDRESS":
+        elif best["cat"] == "AREA_LEVEL":
             res["place_reject"] = best["ev"].reason or None
     res["variants"] = spelling_variants(ctx, g["formatted_address"]) if g["found"] else []
     res["formatted_address"] = g["formatted_address"]
     res["verification"] = ver["status"]
     res["flags"] = flags
-
-    # Too few place words to pin anything down
-    if len(ctx.meaningful) < MIN_MEANINGFUL_WORDS and res["confidence_score"] < 90:
-        res["confidence_score"] = min(res["confidence_score"], SCORE_INCOMPLETE)
-        res["category"] = "INCOMPLETE_ADDRESS"
-        res["flags"].append("TOO_FEW_WORDS")
 
     res["recommended_geofence_m"] = geofence_for_score(res["confidence_score"])
     return res
@@ -1523,7 +1569,7 @@ def _poi_result(best: dict, g: dict, ver: dict) -> dict:
     place, ev = best["place"], best["ev"]
     loc = place["geometry"]["location"]
     name = (place.get("name") or "").strip()
-    kind = {"LANDMARK_EXACT": "LANDMARK_PLACE_MATCH", "INCOMPLETE_ADDRESS": "AREA_PLACE_MATCH"}.get(
+    kind = {"LANDMARK_EXACT": "LANDMARK_PLACE_MATCH", "AREA_LEVEL": "AREA_PLACE_MATCH"}.get(
         best["cat"], "POI_PLACE_MATCH")
     return _blank_result(
         lat=loc["lat"], lng=loc["lng"], status="OK (PLACES_API_MATCH)", source_api="PLACES_API",
@@ -1534,6 +1580,152 @@ def _poi_result(best: dict, g: dict, ver: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Parallel row engine (shared by CSV and PostgreSQL modes)
+# --------------------------------------------------------------------------
+class RunTally:
+    """Counters for one run; only ever touched by the main thread."""
+
+    def __init__(self):
+        self.saved = 0
+        self.done = 0
+        self.skipped_api = 0
+        self.skipped_cache = 0
+        self.review = 0
+        self.categories = Counter()
+
+
+def _process_unique(sanitized, client, stop, no_api=False):
+    """Runs in a worker thread for ONE unique address. Never raises: it returns (kind, payload)
+    and the main thread decides what to do, so a failure in one worker cannot kill the run."""
+    if stop.is_set():
+        return "STOPPED", None
+    if no_api:
+        return "OK", derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
+    try:
+        return "OK", derive_coordinates_with_confidence(sanitized, client)
+    except CacheMiss:
+        return "CACHE_MISS", None
+    except TransientApiError as e:
+        return "TRANSIENT", str(e)
+    except ApiAbort as e:
+        stop.set()                                   # tell every other worker to stop starting new work
+        return "ABORT", str(e)
+    except Exception as e:                           # a bug or odd data in ONE address must not kill the run
+        redact = getattr(client, "_redact", lambda x: str(x)) if client else str
+        return "INTERNAL", (redact(f"{type(e).__name__}: {e}"), redact(traceback.format_exc(limit=3)))
+
+
+def execute_rows(rows, address_col, client, workers, batch, flush, batch_size, tally, show_id, saved_note, no_api=False):
+    """
+    rows: list of (row_key, loan_no, original_address).
+    Identical addresses are sent to the API once.
+    Emits rows strictly in input order so output order is 100% deterministic and resume-safe.
+    Raises ApiAbort / KeyboardInterrupt after the rows finished so far are in `batch`.
+    """
+    total = len(rows)
+
+    def note(key, loan_no, line):
+        tally.done += 1
+        print(f"[{tally.done}/{total}] row {show_id(key)} [{loan_no}]: {line}")
+
+    def emit(key, loan_no, original, sanitized, san_flags, res, line):
+        row = build_row(key, loan_no, address_col, original, sanitized, res, san_flags)
+        tally.categories[row["score_category"]] += 1
+        tally.review += 1 if row["review_needed"] else 0
+        batch.append(row)
+        note(key, loan_no, line)
+        if len(batch) >= batch_size:
+            flush()
+            print(saved_note())
+
+    # Pre-clean all rows and find unique addresses
+    cleaned_rows = []
+    unique_addrs = {}
+    for key, loan_no, original in rows:
+        sanitized, san_flags = sanitize_address(original)
+        cleaned_rows.append((key, loan_no, original, sanitized, san_flags))
+        if sanitized:
+            ckey = _normalize(sanitized)
+            if ckey not in unique_addrs:
+                unique_addrs[ckey] = sanitized
+
+    stop = threading.Event()
+    if hasattr(client, "stop_event"):
+        client.stop_event = stop
+    workers = max(1, int(workers or 1))
+    if unique_addrs and not no_api:
+        print(f"Processing {len(unique_addrs)} unique addresses with {workers} worker(s)")
+    elif unique_addrs and no_api:
+        print(f"Validating {len(unique_addrs)} unique addresses offline with {workers} worker(s)")
+
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="geo")
+    futures = {}
+    try:
+        # Submit all unique addresses
+        for ckey, saddr in unique_addrs.items():
+            futures[ckey] = pool.submit(_process_unique, saddr, client, stop, no_api)
+
+        consecutive_api = consecutive_internal = 0
+        seen_ckeys = set()
+
+        # Iterate in exact input row order
+        for key, loan_no, original, sanitized, san_flags in cleaned_rows:
+            if not sanitized:
+                res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
+                                    category="INVALID_INPUT")
+                emit(key, loan_no, original, sanitized, san_flags, res, "invalid/empty address")
+                continue
+
+            ckey = _normalize(sanitized)
+            fut = futures[ckey]
+            kind, payload = fut.result()
+
+            if kind == "STOPPED":
+                continue
+            if kind == "ABORT":
+                raise ApiAbort(payload)
+            if kind == "CACHE_MISS":
+                tally.skipped_cache += 1
+                note(key, loan_no, "not in cache, skipped (--cache-only)")
+                continue
+            if kind == "TRANSIENT":
+                consecutive_api += 1
+                tally.skipped_api += 1
+                note(key, loan_no, f"API trouble ({payload}); row not saved, it will be retried next run")
+                if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
+                    raise ApiAbort(f"{consecutive_api} addresses in a row failed because of API/network "
+                                   f"errors (last: {payload}). Stopping; progress is saved.")
+                continue
+            if kind == "INTERNAL":
+                consecutive_internal += 1
+                msg, tb = payload
+                print(f"INTERNAL ERROR {msg}\n{tb}")
+                res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
+                                    category="ERROR", flags=[ERROR_DERIVATION])
+                emit(key, loan_no, original, sanitized, san_flags, res, f"INTERNAL ERROR {msg[:80]}")
+                if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
+                    raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
+                continue
+
+            consecutive_api = consecutive_internal = 0
+            res = payload
+            if ckey in seen_ckeys:
+                line = "duplicate address -> reused"
+            else:
+                seen_ckeys.add(ckey)
+                line = f"{res['confidence_score']} {res['category']}  {sanitized[:50]}"
+            emit(key, loan_no, original, sanitized, san_flags, res, line)
+
+    finally:
+        stop.set()
+        if sys.exc_info()[0] is not None:
+            print("Stopping: waiting for requests already in flight to finish...")
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=True)
+
+
 # Output file handling
 # --------------------------------------------------------------------------
 class OutputLock:
@@ -1668,7 +1860,12 @@ def build_remarks(res: dict, flags) -> str:
     elif "SPELLING_ERROR" in flags or cat == "SPELLING_ERROR":
         suspected = res.get("suspected_misspelled_words") or ""
         suggestions = res.get("suggested_spelling_corrections") or ""
-        parts.append(f"Suspected spelling mistake in address: '{suspected}' (suggested: '{suggestions}'); validation stopped without API calls.")
+        if res.get("geocoding_api_called"):
+            parts.append(f"Suspected spelling mistake in address: '{suspected}' (suggested: '{suggestions}'); "
+                         f"the address was still sent to Google, so check the match.")
+        else:
+            parts.append(f"Suspected spelling mistake in address: '{suspected}' (suggested: '{suggestions}'); "
+                         f"validation stopped without API calls.")
     elif "SPELLING_UNCERTAIN" in flags or cat == "SPELLING_UNCERTAIN":
         suspected = res.get("suspected_misspelled_words") or ""
         parts.append(f"Uncertain spelling detected for '{suspected}'; flagged for manual review.")
@@ -1701,9 +1898,9 @@ def build_remarks(res: dict, flags) -> str:
             if subcat == "MISSING_PINCODE":
                 parts.append("Incomplete address: missing 6-digit Indian postal pincode.")
             elif subcat == "TOO_FEW_WORDS":
-                parts.append(f"Incomplete address: only {cnt} major word(s){words_str}; requires at least 3 major words.")
+                parts.append(f"Incomplete address: only {cnt} major word(s){words_str}; requires at least {MIN_MAJOR_WORDS} major words.")
             elif subcat == "ADDRESS_TOO_SHORT":
-                parts.append(f"Incomplete address: address length ({chars_cnt} characters) is below the minimum threshold (15 characters).")
+                parts.append(f"Incomplete address: address length ({chars_cnt} characters) is below the minimum threshold ({MIN_ADDRESS_CHARS} characters).")
             elif subcat == "TOO_SHORT_AND_FEW_WORDS":
                 parts.append(f"Incomplete address: address is too short ({chars_cnt} chars) and contains only {cnt} major word(s){words_str}.")
             elif subcat == "MISSING_PIN_AND_FEW_WORDS":
@@ -1716,8 +1913,6 @@ def build_remarks(res: dict, flags) -> str:
                 parts.append(f"Incomplete address ({subcat}).")
         elif "GEOCODE_UNVERIFIED" in flags:
             parts.append(f"Google's result ('{fa[:80]}') disagrees with the input pincode/locality, so it is not trusted.")
-        elif "TOO_FEW_WORDS" in flags:
-            parts.append("Too few place words to locate the address.")
         elif lt in ("APPROXIMATE", "GEOMETRIC_CENTER"):
             parts.append(f"Area-level match: only the area/locality was found ({lt}); "
                          f"no building, street or landmark matched.")
@@ -1816,238 +2011,76 @@ def build_row(idx, loan_no, address_col, original, sanitized, res, extra_flags):
 
 
 # --------------------------------------------------------------------------
-# Concurrency and Multiprocessing Worker Helpers
-# --------------------------------------------------------------------------
-_worker_client = None
-_worker_cache = None
-_worker_no_api = False
-
-
-def _init_worker_process(api_key, region, cache_db, no_cache, cache_only, max_age_days,
-                         max_api_calls=None, db_mode=False, db_config=None, no_api=False):
-    """Initializer executed once by each worker process in multiprocessing.Pool."""
-    global _worker_client, _worker_cache
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-    cache = None
-    if not no_cache:
-        if db_mode and db_config:
-            try:
-                import psycopg2
-                conn = psycopg2.connect(
-                    host=db_config.get("host"),
-                    port=db_config.get("port"),
-                    dbname=db_config.get("dbname"),
-                    user=db_config.get("user"),
-                    password=db_config.get("password"),
-                    connect_timeout=10,
-                )
-                cache = PostgresCache(
-                    conn,
-                    schema=db_config.get("schema", "public"),
-                    table=db_config.get("cache_table", "geocode_cache"),
-                    max_age_days=max_age_days,
-                )
-            except Exception as e:
-                print(f"[Worker] Warning: could not connect to PostgreSQL cache: {e}")
-                cache = None
-        elif cache_db:
-            try:
-                cache = DiskCache(cache_db, max_age_days)
-            except Exception as e:
-                print(f"[Worker] Warning: could not open SQLite cache {cache_db}: {e}")
-                cache = None
-
-    _worker_cache = cache
-    _worker_no_api = no_api
-    if no_api:
-        _worker_client = None
-    else:
-        _worker_client = ApiClient(api_key, cache, region=region, cache_only=cache_only,
-                                   max_api_calls=max_api_calls)
-
-
-def _process_row_task(task: tuple, client=None, no_api=False) -> dict:
-    """
-    Worker task executing sanitize_address, Stage 1-4 checks, Stage 5-6 geocoding/places,
-    and row construction.
-    task: (idx, loan_no, address_col, original)
-    client: ApiClient instance or None (uses worker-local _worker_client if None)
-    """
-    idx, loan_no, address_col, original = task
-    sanitized, san_flags = sanitize_address(original)
-    is_no_api = no_api or _worker_no_api
-
-    if not sanitized:
-        res = _blank_result(
-            status="Invalid/empty address",
-            derivation_type="INVALID_INPUT",
-            category="INVALID_INPUT",
-        )
-        row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
-        return {
-            "status": "INVALID_INPUT",
-            "idx": idx,
-            "loan_no": loan_no,
-            "sanitized": sanitized,
-            "res": res,
-            "row": row,
-            "api_calls": 0,
-            "cache_hits": 0,
-        }
-
-    if is_no_api:
-        res = derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
-        row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
-        return {
-            "status": "OK",
-            "idx": idx,
-            "loan_no": loan_no,
-            "sanitized": sanitized,
-            "res": res,
-            "row": row,
-            "api_calls": 0,
-            "cache_hits": 0,
-        }
-
-    c = client or _worker_client
-    if c is None:
-        raise RuntimeError("Worker ApiClient is not initialized")
-
-    calls_before = getattr(c, "stats", {}).get("api_calls", 0)
-    hits_before = getattr(c, "stats", {}).get("cache_hits", 0)
-
-    try:
-        res = derive_coordinates_with_confidence(sanitized, c)
-    except CacheMiss:
-        return {
-            "status": "CACHE_MISS",
-            "idx": idx,
-            "loan_no": loan_no,
-            "sanitized": sanitized,
-            "api_calls": 0,
-            "cache_hits": 0,
-        }
-    except TransientApiError as e:
-        calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
-        hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
-        return {
-            "status": "TRANSIENT_API_ERROR",
-            "idx": idx,
-            "loan_no": loan_no,
-            "sanitized": sanitized,
-            "error": str(e),
-            "api_calls": calls_delta,
-            "cache_hits": hits_delta,
-        }
-    except ApiAbort as e:
-        calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
-        hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
-        return {
-            "status": "API_ABORT",
-            "idx": idx,
-            "loan_no": loan_no,
-            "sanitized": sanitized,
-            "error": str(e),
-            "api_calls": calls_delta,
-            "cache_hits": hits_delta,
-        }
-    except Exception as e:
-        msg = getattr(c, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
-        res = _blank_result(
-            status=msg[:200],
-            derivation_type=ERROR_DERIVATION,
-            category="ERROR",
-            flags=[ERROR_DERIVATION],
-        )
-        row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
-        calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
-        hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
-        return {
-            "status": "INTERNAL_ERROR",
-            "idx": idx,
-            "loan_no": loan_no,
-            "sanitized": sanitized,
-            "error": msg,
-            "res": res,
-            "row": row,
-            "api_calls": calls_delta,
-            "cache_hits": hits_delta,
-        }
-
-    calls_delta = getattr(c, "stats", {}).get("api_calls", 0) - calls_before
-    hits_delta = getattr(c, "stats", {}).get("cache_hits", 0) - hits_before
-    row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
-    return {
-        "status": "OK",
-        "idx": idx,
-        "loan_no": loan_no,
-        "sanitized": sanitized,
-        "res": res,
-        "row": row,
-        "api_calls": calls_delta,
-        "cache_hits": hits_delta,
-    }
-
-
-# --------------------------------------------------------------------------
 # Database helpers (PostgreSQL)
 # --------------------------------------------------------------------------
 class PostgresCache:
     """Stores the trimmed raw API answer per request in PostgreSQL, matching DiskCache interface."""
 
-    def __init__(self, conn, schema="public", table="geocode_cache", max_age_days=DEFAULT_CACHE_MAX_AGE_DAYS):
+    def __init__(self, conn, schema="public", table="geocode_cache", max_age_days=DEFAULT_CACHE_MAX_AGE_DAYS,
+                 owns_conn=False):
         self.conn = conn
+        self.owns_conn = owns_conn                   # True: this cache has its own connection and closes it
+        self._lock = threading.Lock()
         self.schema = schema
         self.table = table
         self.max_age_days = max_age_days if (max_age_days and max_age_days > 0) else None
 
     def get(self, key):
-        cur = self.conn.cursor()
-        try:
-            if self.max_age_days is None:
-                cur.execute(f"SELECT response FROM {self.schema}.{self.table} WHERE key = %s;", (key,))
-            else:
-                cur.execute(
-                    f"SELECT response FROM {self.schema}.{self.table} "
-                    f"WHERE key = %s AND saved_at >= CURRENT_TIMESTAMP - (%s || ' days')::INTERVAL;",
-                    (key, str(int(self.max_age_days)))
-                )
-            row = cur.fetchone()
-            if not row:
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                if self.max_age_days is None:
+                    cur.execute(f"SELECT response FROM {self.schema}.{self.table} WHERE key = %s;", (key,))
+                else:
+                    cur.execute(
+                        f"SELECT response FROM {self.schema}.{self.table} "
+                        f"WHERE key = %s AND saved_at >= CURRENT_TIMESTAMP - (%s || ' days')::INTERVAL;",
+                        (key, str(int(self.max_age_days)))
+                    )
+                row = cur.fetchone()
+                self.conn.commit()                   # do not leave a transaction open between reads
+                if not row:
+                    return None
+                val = row[0]
+                if isinstance(val, (dict, list)):
+                    return val
+                return json.loads(val)
+            except Exception:
+                try:
+                    self.conn.rollback()             # a failed read must not poison later queries
+                except Exception:
+                    pass
                 return None
-            val = row[0]
-            if isinstance(val, (dict, list)):
-                return val
-            return json.loads(val)
-        except Exception:
-            return None
-        finally:
-            cur.close()
+            finally:
+                cur.close()
 
     def set(self, key, data):
         from psycopg2.extras import Json
-        cur = self.conn.cursor()
-        try:
-            cur.execute(f"""
-            INSERT INTO {self.schema}.{self.table} (key, response, saved_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (key) DO UPDATE SET
-                response = EXCLUDED.response,
-                saved_at = CURRENT_TIMESTAMP;
-            """, (key, Json(data)))
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(f"""
+                INSERT INTO {self.schema}.{self.table} (key, response, saved_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET
+                    response = EXCLUDED.response,
+                    saved_at = CURRENT_TIMESTAMP;
+                """, (key, Json(data)))
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+            finally:
+                cur.close()
 
     def close(self):
-        pass
+        if self.owns_conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
 
 def load_env(env_path=None):
@@ -2325,9 +2358,9 @@ def _run_db(args, api_key, client_factory) -> int:
     total_pending = len(rows)
 
     if args.random:
-        if args.seed is not None:
-            random.seed(args.seed)
-        random.shuffle(rows)
+        seed = args.seed if args.seed is not None else random.randrange(2 ** 32)
+        random.Random(seed).shuffle(rows)
+        print(f"Random sampling (seed = {seed}; add --seed {seed} to repeat this exact order)")
     if args.limit is not None:
         rows = rows[:max(0, args.limit)]
         print(f"Found {total_pending} pending rows; processing up to {len(rows)} {'random ' if args.random else ''}(limit = {args.limit})")
@@ -2348,16 +2381,22 @@ def _run_db(args, api_key, client_factory) -> int:
         return 0
 
     cache = None
-    if not args.no_cache and not args.no_api:
-        cache = PostgresCache(conn, db_schema, args.cache_table, args.cache_max_age_days)
+    if not args.no_cache:
+        try:        # the cache gets its OWN connection so worker threads never touch the batch transaction
+            cache_conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user,
+                                          password=db_password, connect_timeout=10)
+        except Exception as e:
+            print(f"ERROR: Cannot open the cache connection to PostgreSQL: {e}")
+            cur.close()
+            conn.close()
+            return 1
+        cache = PostgresCache(cache_conn, db_schema, args.cache_table, args.cache_max_age_days, owns_conn=True)
         print(f"Using PostgreSQL cache table: {db_schema}.{args.cache_table}")
     if client_factory is not None:
         client = client_factory(args, cache)
-    elif args.no_api:
-        client = None
     else:
         client = ApiClient(api_key, cache, region=args.region, cache_only=args.cache_only,
-                           max_api_calls=args.max_api_calls)
+                           max_api_calls=args.max_api_calls, max_qps=args.max_qps)
     stats = getattr(client, "stats", {"api_calls": 0, "cache_hits": 0})
 
     def _sigterm(signum, frame):
@@ -2367,216 +2406,36 @@ def _run_db(args, api_key, client_factory) -> int:
     except (ValueError, AttributeError):
         pass
 
-    batch = []
-    memo = {}
-    saved_total = skipped_api = skipped_cache = 0
-    consecutive_api = consecutive_internal = 0
-    categories = Counter()
-    review = 0
+    batch: list = []
+    tally = RunTally()
     exit_code = 0
 
     def flush_db():
-        nonlocal saved_total
         if batch:
             save_db_batch(conn, db_schema, output_table, batch)
-            saved_total += len(batch)
+            tally.saved += len(batch)
             batch.clear()
 
-    workers = getattr(args, "workers", 1) or 1
-    worker_mode = getattr(args, "worker_mode", "process") or "process"
-    if workers < 1:
-        workers = 1
+    try:
+        execute_rows(rows, address_col, client, args.workers, batch, flush_db, args.batch_size, tally,
+                     show_id=lambda k: k,
+                     saved_note=lambda: f"   [saved {tally.saved} rows so far to PostgreSQL ({db_schema}.{output_table})]",
+                     no_api=getattr(args, 'no_api', False))
+    except ApiAbort as e:
+        print(f"\nSTOPPED: {e}")
+        exit_code = 1
+    except KeyboardInterrupt:
+        print("\nInterrupted; saving what is done to PostgreSQL.")
+        exit_code = 130
+    finally:
+        flush_db()
+        cur.close()
+        conn.close()
+        if cache is not None:
+            cache.close()
 
-    if workers == 1:
-        try:
-            for n, (row_id, loan_no, original) in enumerate(rows, start=1):
-                sanitized, san_flags = sanitize_address(original)
-
-                if not sanitized:
-                    res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
-                                        category="INVALID_INPUT")
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: invalid/empty address")
-                else:
-                    ckey = _normalize(sanitized)
-                    if ckey in memo:
-                        res = memo[ckey]
-                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: duplicate address -> reused")
-                    elif args.no_api:
-                        res = derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
-                        memo[ckey] = res
-                        print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
-                              f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
-                    else:
-                        try:
-                            res = derive_coordinates_with_confidence(sanitized, client)
-                        except CacheMiss:
-                            skipped_cache += 1
-                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: not in cache, skipped (--cache-only)")
-                            continue
-                        except TransientApiError as e:
-                            skipped_api += 1
-                            consecutive_api += 1
-                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: API trouble ({e}); "
-                                  f"row not saved, it will be retried next run")
-                            if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
-                                raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
-                                               f"errors (last: {e}). Stopping; progress is saved in PostgreSQL.")
-                            continue
-                        except (ApiAbort, KeyboardInterrupt):
-                            raise
-                        except Exception as e:
-                            consecutive_internal += 1
-                            msg = getattr(client, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
-                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: INTERNAL ERROR {msg}")
-                            traceback.print_exc(limit=3)
-                            res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
-                                                category="ERROR", flags=[ERROR_DERIVATION])
-                            if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
-                                batch.append(build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags))
-                                raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
-                        else:
-                            consecutive_api = consecutive_internal = 0
-                            memo[ckey] = res
-                            time.sleep(REQUEST_PAUSE_S)
-                            print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
-                                  f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
-
-                row = build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags)
-                categories[row["score_category"]] += 1
-                review += 1 if row["review_needed"] else 0
-                batch.append(row)
-                if len(batch) >= args.batch_size:
-                    flush_db()
-                    print(f"   [saved {saved_total} rows so far to PostgreSQL ({db_schema}.{output_table})]")
-
-        except ApiAbort as e:
-            print(f"\nSTOPPED: {e}")
-            exit_code = 1
-        except KeyboardInterrupt:
-            print("\nInterrupted; saving what is done to PostgreSQL.")
-            exit_code = 130
-        finally:
-            flush_db()
-            cur.close()
-            conn.close()
-            if cache is not None:
-                cache.close()
-    else:
-        effective_mode = worker_mode
-        if client_factory is not None and effective_mode == "process":
-            effective_mode = "thread"
-
-        print(f"Running with {workers} concurrent workers (mode: {effective_mode})")
-        tasks = [(row_id, loan_no, address_col, original) for (row_id, loan_no, original) in rows]
-
-        pool_context = None
-        try:
-            if effective_mode == "process":
-                db_config = {
-                    "host": db_host,
-                    "port": db_port,
-                    "dbname": db_name,
-                    "user": db_user,
-                    "password": db_password,
-                    "schema": db_schema,
-                    "cache_table": args.cache_table,
-                }
-                init_args = (
-                    api_key,
-                    args.region,
-                    None,
-                    args.no_cache,
-                    args.cache_only,
-                    args.cache_max_age_days,
-                    args.max_api_calls,
-                    True,
-                    db_config,
-                    args.no_api,
-                )
-                pool_context = multiprocessing.Pool(
-                    processes=workers,
-                    initializer=_init_worker_process,
-                    initargs=init_args,
-                )
-                task_iter = pool_context.imap(_process_row_task, tasks, chunksize=1)
-            else:
-                pool_context = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-                worker_func = functools.partial(_process_row_task, client=client, no_api=args.no_api)
-                task_iter = pool_context.map(worker_func, tasks)
-
-            for n, res_dict in enumerate(task_iter, start=1):
-                status = res_dict["status"]
-                row_id = res_dict["idx"]
-                loan_no = res_dict["loan_no"]
-                sanitized = res_dict.get("sanitized", "")
-                stats["api_calls"] += res_dict.get("api_calls", 0)
-                stats["cache_hits"] += res_dict.get("cache_hits", 0)
-
-                if status == "INVALID_INPUT":
-                    consecutive_api = consecutive_internal = 0
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: invalid/empty address")
-                    row = res_dict["row"]
-                elif status == "CACHE_MISS":
-                    skipped_cache += 1
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: not in cache, skipped (--cache-only)")
-                    continue
-                elif status == "TRANSIENT_API_ERROR":
-                    skipped_api += 1
-                    consecutive_api += 1
-                    err_msg = res_dict.get("error", "API error")
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: API trouble ({err_msg}); "
-                          f"row not saved, it will be retried next run")
-                    if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
-                        raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
-                                       f"errors (last: {err_msg}). Stopping; progress is saved in PostgreSQL.")
-                    continue
-                elif status == "API_ABORT":
-                    err_msg = res_dict.get("error", "API abort")
-                    raise ApiAbort(f"API aborted: {err_msg}")
-                elif status == "INTERNAL_ERROR":
-                    consecutive_internal += 1
-                    err_msg = res_dict.get("error", "Internal error")
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: INTERNAL ERROR {err_msg}")
-                    row = res_dict["row"]
-                    if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
-                        batch.append(row)
-                        raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
-                else:  # status == "OK"
-                    consecutive_api = consecutive_internal = 0
-                    res = res_dict["res"]
-                    row = res_dict["row"]
-                    print(f"[{n}/{len(rows)}] row {row_id} [{loan_no}]: "
-                          f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
-
-                categories[row["score_category"]] += 1
-                review += 1 if row["review_needed"] else 0
-                batch.append(row)
-                if len(batch) >= args.batch_size:
-                    flush_db()
-                    print(f"   [saved {saved_total} rows so far to PostgreSQL ({db_schema}.{output_table})]")
-
-                if args.max_api_calls is not None and stats["api_calls"] >= args.max_api_calls:
-                    raise ApiAbort(f"--max-api-calls budget of {args.max_api_calls} reached")
-
-        except ApiAbort as e:
-            print(f"\nSTOPPED: {e}")
-            exit_code = 1
-        except KeyboardInterrupt:
-            print("\nInterrupted; saving what is done to PostgreSQL.")
-            exit_code = 130
-        finally:
-            if pool_context is not None:
-                if effective_mode == "process":
-                    pool_context.terminate()
-                    pool_context.join()
-                else:
-                    pool_context.shutdown(wait=False, cancel_futures=True)
-            flush_db()
-            cur.close()
-            conn.close()
-            if cache is not None:
-                cache.close()
-
+    saved_total, categories, review = tally.saved, tally.categories, tally.review
+    skipped_api, skipped_cache = tally.skipped_api, tally.skipped_cache
     print(f"\nDone. {saved_total} rows written to PostgreSQL -> {db_schema}.{output_table}")
     if categories:
         print("Categories: " + ", ".join(f"{k}={v}" for k, v in sorted(categories.items())))
@@ -2588,6 +2447,7 @@ def _run_db(args, api_key, client_factory) -> int:
     print(f"API calls made: {stats.get('api_calls', 0)} | served from disk cache: {stats.get('cache_hits', 0)}")
     if getattr(args, "no_api", False):
         valid_cnt = categories.get("VALID_ADDRESS", 0) + categories.get("SYNONYM_NORMALIZED", 0)
+        spell_cnt = categories.get("SPELLING_MISTAKE", 0) + categories.get("SPELLING_ERROR", 0)
         print("\n=== Pre-API Detection Summary ===")
         print(f"Total Rows Processed: {saved_total}")
         print(f"  * Valid Addresses (Ready for API): {valid_cnt}")
@@ -2596,7 +2456,7 @@ def _run_db(args, api_key, client_factory) -> int:
         print(f"  * Flagged / Pre-API Issues (No API Needed):")
         print(f"    - Incomplete Address (Stage 1): {categories.get('INCOMPLETE_ADDRESS', 0)}")
         print(f"    - Conflicting PIN Codes (Stage 2): {categories.get('DOUBLE_PINCODE', 0)}")
-        print(f"    - Spelling Errors (Stage 3): {categories.get('SPELLING_MISTAKE', 0) + categories.get('SPELLING_ERROR', 0)}")
+        print(f"    - Spelling Errors (Stage 3): {spell_cnt}")
         print(f"    - Empty / Invalid Input: {categories.get('INVALID_INPUT', 0)}")
         print(f"Total Flagged for Review: {review}")
         print("=================================\n")
@@ -2613,17 +2473,21 @@ def parse_arguments(argv=None):
     p.add_argument("--address-col", "-a", default=None, help="Address column (auto-detects soa_current_address / Addresses / address)")
     p.add_argument("--loan-col", "-l", default="soa_loan_no", help="Loan number column (default: soa_loan_no)")
     p.add_argument("--limit", "-n", type=int, default=None, help="Process at most N NEW rows this run")
-    p.add_argument("--random", "-r", action="store_true", help="Sample N random rows instead of first N sequential rows")
+    p.add_argument("--random", "-r", action="store_true", help="Pick rows in random order instead of file order (use with --limit)")
+    p.add_argument("--sample", type=int, default=None, metavar="N",
+                   help="Shortcut for --random --limit N: process N random rows that are not done yet")
     p.add_argument("--seed", type=int, default=None, help="Random seed for reproducible sampling (e.g. --seed 42)")
-    p.add_argument("--batch-size", "-b", type=int, default=20, help="Rows per save to CSV / PostgreSQL (default: 20)")
     p.add_argument("--no-api", "--pre-api-only", "--validate-only",
                    dest="no_api", action="store_true",
                    help="Run all pre-API validation stages (Stage 1 Incomplete, Stage 2 Conflicting PINs, "
                         "Stage 3 Spelling, Stage 4 Synonym) across all rows without making any Google API calls.")
-    p.add_argument("--workers", "-w", type=int, default=1,
-                   help="Number of concurrent workers (default: 1; >1 enables multiprocessing)")
-    p.add_argument("--worker-mode", choices=["process", "thread"], default="process",
-                   help="Concurrency backend: 'process' (multiprocessing, default) or 'thread' (multithreading)")
+    p.add_argument("--worker-mode", choices=["process", "thread"], default="thread",
+                   help="Concurrency backend: 'process' (multiprocessing) or 'thread' (multithreading, default)")
+    p.add_argument("--workers", "-w", type=int, default=DEFAULT_WORKERS,
+                   help=f"Addresses processed at the same time (default {DEFAULT_WORKERS}; 1 = one at a time)")
+    p.add_argument("--max-qps", type=float, default=DEFAULT_MAX_QPS,
+                   help=f"Max Google requests per second across all workers (default {DEFAULT_MAX_QPS:g}; 0 = unlimited)")
+    p.add_argument("--batch-size", "-b", type=int, default=20, help="Rows per save to CSV / PostgreSQL (default: 20)")
     p.add_argument("--region", default="in", help="Region bias for Google (default: in)")
     p.add_argument("--cache-db", default=DEFAULT_CACHE_DB, help=f"SQLite cache file (default: {DEFAULT_CACHE_DB})")
     p.add_argument("--no-cache", action="store_true", help="Disable the cache (every address hits the APIs)")
@@ -2647,7 +2511,14 @@ def parse_arguments(argv=None):
     p.add_argument("--input-table", default="geocoding", help="Postgres input table name (default: geocoding)")
     p.add_argument("--output-table", default="geocoding_processed", help="Postgres output table name (default: geocoding_processed)")
     p.add_argument("--cache-table", default="geocode_cache", help="Postgres cache table name (default: geocode_cache)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.workers < 1:
+        p.error("--workers must be at least 1")
+    if args.max_qps < 0:
+        p.error("--max-qps cannot be negative")
+    if args.sample is not None:
+        args.random, args.limit = True, args.sample
+    return args
 
 
 def read_csv_safe(path):
@@ -2681,7 +2552,7 @@ def main(argv=None, client_factory=None) -> int:
     # Database Mode
     if args.db or (args.input and args.input.lower() in ("db", "database", "postgres")):
         api_key = os.environ.get(API_KEY_ENV, "").strip()
-        if client_factory is None and not args.cache_only and not args.dry_run and not args.no_api and not api_key:
+        if client_factory is None and not args.cache_only and not args.dry_run and not getattr(args, "no_api", False) and not api_key:
             print(f"Error: set the {API_KEY_ENV} environment variable (or use --cache-only / --dry-run).")
             return 2
         return _run_db(args, api_key, client_factory)
@@ -2716,7 +2587,7 @@ def main(argv=None, client_factory=None) -> int:
 
     # ---- API key ----------------------------------------------------------
     api_key = os.environ.get(API_KEY_ENV, "").strip()
-    if client_factory is None and not args.cache_only and not args.no_api and not api_key:
+    if client_factory is None and not args.cache_only and not getattr(args, "no_api", False) and not api_key:
         print(f"Error: set the {API_KEY_ENV} environment variable (or use --cache-only / --dry-run).")
         return 2
 
@@ -2767,9 +2638,9 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
 
     todo = [i for i in range(total_records) if i not in processed_rows]
     if args.random:
-        if args.seed is not None:
-            random.seed(args.seed)
-        random.shuffle(todo)
+        seed = args.seed if args.seed is not None else random.randrange(2 ** 32)
+        random.Random(seed).shuffle(todo)
+        print(f"Random sampling (seed = {seed}; add --seed {seed} to repeat this exact order)")
     if args.limit is not None:
         todo = todo[:max(0, args.limit)]
         print(f"Processing up to {len(todo)} new {'random ' if args.random else ''}rows (limit = {args.limit})")
@@ -2777,16 +2648,14 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
 
     # ---- client ------------------------------------------------------------
     cache = None
-    if not args.no_cache and not args.no_api:
+    if not args.no_cache:
         cache = DiskCache(args.cache_db, args.cache_max_age_days)
         print(f"Using disk cache: {args.cache_db}")
     if client_factory is not None:
         client = client_factory(args, cache)
-    elif args.no_api:
-        client = None
     else:
         client = ApiClient(api_key, cache, region=args.region, cache_only=args.cache_only,
-                           max_api_calls=args.max_api_calls)
+                           max_api_calls=args.max_api_calls, max_qps=args.max_qps)
     stats = getattr(client, "stats", {"api_calls": 0, "cache_hits": 0})
 
     def _sigterm(signum, frame):
@@ -2797,204 +2666,33 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
         pass
 
     batch: list = []
-    memo: dict = {}                      # normalized address -> result, for duplicates inside this run
-    saved_total = skipped_api = skipped_cache = 0
-    consecutive_api = consecutive_internal = 0
-    categories: Counter = Counter()
-    review = 0
+    tally = RunTally()
     exit_code = 0
 
     def flush():
-        nonlocal saved_total
         if batch:
             append_rows(output_csv, batch)
-            saved_total += len(batch)
+            tally.saved += len(batch)
             batch.clear()
 
-    workers = getattr(args, "workers", 1) or 1
-    worker_mode = getattr(args, "worker_mode", "process") or "process"
-    if workers < 1:
-        workers = 1
+    try:
+        execute_rows([(i, loans[i], addresses[i]) for i in todo], address_col, client, args.workers,
+                     batch, flush, args.batch_size, tally, show_id=lambda k: k + 1,
+                     saved_note=lambda: f"   [saved {tally.saved} rows so far]",
+                     no_api=getattr(args, 'no_api', False))
+    except ApiAbort as e:
+        print(f"\nSTOPPED: {e}")
+        exit_code = 1
+    except KeyboardInterrupt:
+        print("\nInterrupted; saving what is done.")
+        exit_code = 130
+    finally:
+        flush()
+        if cache is not None:
+            cache.close()
 
-    if workers == 1:
-        try:
-            for n, idx in enumerate(todo, start=1):
-                loan_no = loans[idx]
-                original = addresses[idx]
-                sanitized, san_flags = sanitize_address(original)
-
-                if not sanitized:
-                    res = _blank_result(status="Invalid/empty address", derivation_type="INVALID_INPUT",
-                                        category="INVALID_INPUT")
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: invalid/empty address")
-                else:
-                    ckey = _normalize(sanitized)
-                    if ckey in memo:
-                        res = memo[ckey]
-                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: duplicate address -> reused")
-                    elif args.no_api:
-                        res = derive_coordinates_with_confidence(sanitized, client=None, no_api=True)
-                        memo[ckey] = res
-                        print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
-                              f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
-                    else:
-                        try:
-                            res = derive_coordinates_with_confidence(sanitized, client)
-                        except CacheMiss:
-                            skipped_cache += 1
-                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: not in cache, skipped (--cache-only)")
-                            continue
-                        except TransientApiError as e:
-                            skipped_api += 1
-                            consecutive_api += 1
-                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: API trouble ({e}); "
-                                  f"row not saved, it will be retried next run")
-                            if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
-                                raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
-                                               f"errors (last: {e}). Stopping; progress is saved.")
-                            continue
-                        except (ApiAbort, KeyboardInterrupt):
-                            raise
-                        except Exception as e:            # a bug or odd data in ONE row must not kill the run
-                            consecutive_internal += 1
-                            msg = getattr(client, "_redact", lambda x: str(x))(f"{type(e).__name__}: {e}")
-                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: INTERNAL ERROR {msg}")
-                            traceback.print_exc(limit=3)
-                            res = _blank_result(status=msg[:200], derivation_type=ERROR_DERIVATION,
-                                                category="ERROR", flags=[ERROR_DERIVATION])
-                            if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
-                                batch.append(build_row(idx, loan_no, address_col, original, sanitized, res, san_flags))
-                                raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
-                        else:
-                            consecutive_api = consecutive_internal = 0
-                            memo[ckey] = res
-                            time.sleep(REQUEST_PAUSE_S)
-                            print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
-                                  f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
-
-                row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
-                categories[row["score_category"]] += 1
-                review += 1 if row["review_needed"] else 0
-                batch.append(row)
-                if len(batch) >= args.batch_size:
-                    flush()
-                    print(f"   [saved {saved_total} rows so far]")
-
-        except ApiAbort as e:
-            print(f"\nSTOPPED: {e}")
-            exit_code = 1
-        except KeyboardInterrupt:
-            print("\nInterrupted; saving what is done.")
-            exit_code = 130
-        finally:
-            flush()
-            if cache is not None:
-                cache.close()
-    else:
-        effective_mode = worker_mode
-        if client_factory is not None and effective_mode == "process":
-            effective_mode = "thread"
-
-        print(f"Running with {workers} concurrent workers (mode: {effective_mode})")
-        tasks = [(idx, loans[idx], address_col, addresses[idx]) for idx in todo]
-
-        pool_context = None
-        try:
-            if effective_mode == "process":
-                init_args = (
-                    api_key,
-                    args.region,
-                    args.cache_db,
-                    args.no_cache,
-                    args.cache_only,
-                    args.cache_max_age_days,
-                    args.max_api_calls,
-                    False,
-                    None,
-                    args.no_api,
-                )
-                pool_context = multiprocessing.Pool(
-                    processes=workers,
-                    initializer=_init_worker_process,
-                    initargs=init_args,
-                )
-                task_iter = pool_context.imap(_process_row_task, tasks, chunksize=1)
-            else:
-                pool_context = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-                worker_func = functools.partial(_process_row_task, client=client, no_api=args.no_api)
-                task_iter = pool_context.map(worker_func, tasks)
-
-            for n, res_dict in enumerate(task_iter, start=1):
-                status = res_dict["status"]
-                idx = res_dict["idx"]
-                loan_no = res_dict["loan_no"]
-                sanitized = res_dict.get("sanitized", "")
-                stats["api_calls"] += res_dict.get("api_calls", 0)
-                stats["cache_hits"] += res_dict.get("cache_hits", 0)
-
-                if status == "INVALID_INPUT":
-                    consecutive_api = consecutive_internal = 0
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: invalid/empty address")
-                    row = res_dict["row"]
-                elif status == "CACHE_MISS":
-                    skipped_cache += 1
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: not in cache, skipped (--cache-only)")
-                    continue
-                elif status == "TRANSIENT_API_ERROR":
-                    skipped_api += 1
-                    consecutive_api += 1
-                    err_msg = res_dict.get("error", "API error")
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: API trouble ({err_msg}); "
-                          f"row not saved, it will be retried next run")
-                    if consecutive_api >= MAX_CONSECUTIVE_ERRORS:
-                        raise ApiAbort(f"{consecutive_api} rows in a row failed because of API/network "
-                                       f"errors (last: {err_msg}). Stopping; progress is saved.")
-                    continue
-                elif status == "API_ABORT":
-                    err_msg = res_dict.get("error", "API abort")
-                    raise ApiAbort(f"API aborted: {err_msg}")
-                elif status == "INTERNAL_ERROR":
-                    consecutive_internal += 1
-                    err_msg = res_dict.get("error", "Internal error")
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: INTERNAL ERROR {err_msg}")
-                    row = res_dict["row"]
-                    if consecutive_internal >= MAX_CONSECUTIVE_INTERNAL_ERRORS:
-                        batch.append(row)
-                        raise ApiAbort(f"{consecutive_internal} internal errors in a row; stopping.")
-                else:  # status == "OK"
-                    consecutive_api = consecutive_internal = 0
-                    res = res_dict["res"]
-                    row = res_dict["row"]
-                    print(f"[{n}/{len(todo)}] row {idx + 1} [{loan_no}]: "
-                          f"{res['confidence_score']} {res['category']}  {sanitized[:50]}")
-
-                categories[row["score_category"]] += 1
-                review += 1 if row["review_needed"] else 0
-                batch.append(row)
-                if len(batch) >= args.batch_size:
-                    flush()
-                    print(f"   [saved {saved_total} rows so far]")
-
-                if args.max_api_calls is not None and stats["api_calls"] >= args.max_api_calls:
-                    raise ApiAbort(f"--max-api-calls budget of {args.max_api_calls} reached")
-
-        except ApiAbort as e:
-            print(f"\nSTOPPED: {e}")
-            exit_code = 1
-        except KeyboardInterrupt:
-            print("\nInterrupted; saving what is done.")
-            exit_code = 130
-        finally:
-            if pool_context is not None:
-                if effective_mode == "process":
-                    pool_context.terminate()
-                    pool_context.join()
-                else:
-                    pool_context.shutdown(wait=False, cancel_futures=True)
-            flush()
-            if cache is not None:
-                cache.close()
-
+    saved_total, categories, review = tally.saved, tally.categories, tally.review
+    skipped_api, skipped_cache = tally.skipped_api, tally.skipped_cache
     print(f"\nDone. {saved_total} rows written this run -> {output_csv}")
     if categories:
         print("Categories: " + ", ".join(f"{k}={v}" for k, v in sorted(categories.items())))
@@ -3006,6 +2704,7 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
     print(f"API calls made: {stats.get('api_calls', 0)} | served from disk cache: {stats.get('cache_hits', 0)}")
     if getattr(args, "no_api", False):
         valid_cnt = categories.get("VALID_ADDRESS", 0) + categories.get("SYNONYM_NORMALIZED", 0)
+        spell_cnt = categories.get("SPELLING_MISTAKE", 0) + categories.get("SPELLING_ERROR", 0)
         print("\n=== Pre-API Detection Summary ===")
         print(f"Total Rows Processed: {saved_total}")
         print(f"  * Valid Addresses (Ready for API): {valid_cnt}")
@@ -3014,7 +2713,7 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
         print(f"  * Flagged / Pre-API Issues (No API Needed):")
         print(f"    - Incomplete Address (Stage 1): {categories.get('INCOMPLETE_ADDRESS', 0)}")
         print(f"    - Conflicting PIN Codes (Stage 2): {categories.get('DOUBLE_PINCODE', 0)}")
-        print(f"    - Spelling Errors (Stage 3): {categories.get('SPELLING_MISTAKE', 0) + categories.get('SPELLING_ERROR', 0)}")
+        print(f"    - Spelling Errors (Stage 3): {spell_cnt}")
         print(f"    - Empty / Invalid Input: {categories.get('INVALID_INPUT', 0)}")
         print(f"Total Flagged for Review: {review}")
         print("=================================\n")
