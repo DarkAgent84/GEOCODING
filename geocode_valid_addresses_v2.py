@@ -64,13 +64,13 @@ import sys
 import time
 import traceback
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime
 
 import pandas as pd
 import requests
 
-SCRIPT_VERSION = "2.0"
+SCRIPT_VERSION = "3.0"
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -97,31 +97,44 @@ MAX_CONSECUTIVE_INTERNAL_ERRORS = 10
 REQUEST_PAUSE_S = 0.1
 MAX_ADDRESS_CHARS = 300
 
-# Scores (Deterministic Multi-Stage Classification Pipeline)
-SCORE_ROOFTOP = 100                                 # Stage 6: Strict Exact Match
-SCORE_POI_PREMISE_BASE = 90                         # Stage 5: Verified POI Exact Match base
-SCORE_POI_MAX = 99                                  # Stage 5: Verified POI Exact Match max
-SCORE_LANDMARK = 70                                 # Near / opposite / behind a landmark
+# Scores
+SCORE_ROOFTOP = 100
+SCORE_POI_PREMISE_BASE = 90         # POI that is the address itself
+SCORE_POI_MAX = 99
+SCORE_LANDMARK = 70                 # POI the address is "near / opposite / behind"
 SCORE_LANDMARK_MAX = 80
-SCORE_SYNONYM_MIN, SCORE_SYNONYM_MAX = 60, 70       # Stage 4: Synonym Normalization Preprocessing
-SCORE_PARTIAL = 50                                  # Google rooftop partial_match
-SCORE_INTERPOLATED = 45                             # Google range-interpolated street-level
-SCORE_SPELLING_MIN, SCORE_SPELLING_MAX = 21, 30     # Stage 3: Pre-API Spelling Error Detection
-SCORE_LANDMARK_FUZZY = SCORE_SPELLING_MIN           # Misspelled landmark name
-SCORE_DOUBLE_PIN_MIN, SCORE_DOUBLE_PIN_MAX = 11, 20 # Stage 2: Duplicate / Conflicting PIN Codes
-SCORE_STREET = 25                                   # Street-level geocode
-SCORE_INCOMPLETE_MIN, SCORE_INCOMPLETE_MAX = 0, 9  # Stage 1: Incomplete Address Detection
-SCORE_INCOMPLETE = 5
+SCORE_SYNONYM_MIN, SCORE_SYNONYM_MAX = 60, 70  # Synonym normalization preprocessing score band
+SCORE_PARTIAL = 50
+SCORE_INTERPOLATED = 45
+SCORE_STREET = 35                   # Street-level geocode
+SCORE_AREA_LEVEL = 10               # Locality / area-level coarse geocode
+SCORE_SPELLING_MIN, SCORE_SPELLING_MAX = 21, 30   # close misspelling of a place name
+SCORE_LANDMARK_FUZZY = SCORE_SPELLING_MIN         # misspelled name, but only as a "near X" landmark
+SCORE_DOUBLE_PIN_MIN, SCORE_DOUBLE_PIN_MAX = 11, 20   # address contains two different pincodes
+SCORE_INCOMPLETE = 10               # Post-API incomplete / unresolved legacy fallback
+SCORE_INCOMPLETE_MIN, SCORE_INCOMPLETE_MAX = 0, 9     # Stage 1 incomplete address pre-API score band
 
-# API Pricing Constants (USD per request, standard Google Maps Platform pricing)
-COST_GEOCODING_PER_REQ = 0.005                      # $5.00 per 1,000 requests
-COST_PLACES_PER_REQ = 0.032                         # $32.00 per 1,000 requests
+# Stage 1 subcategory scores (0-9)
+INCOMPLETE_SUBCAT_SCORES = {
+    "ALL_CRITERIA_FAILED": 0,
+    "MISSING_PIN_AND_TOO_SHORT": 2,
+    "MISSING_PIN_AND_FEW_WORDS": 3,
+    "TOO_SHORT_AND_FEW_WORDS": 4,
+    "ADDRESS_TOO_SHORT": 5,
+    "TOO_FEW_WORDS": 6,
+    "MISSING_PINCODE": 7,
+}
 
 # Name matching
 SPELLING_SIMILARITY_MIN = 0.80      # mean word similarity needed for a "spelling mistake" match
 SINGLE_WORD_SPELLING_MIN = 0.90     # stricter when only one distinctive word is available
 MIN_TOKEN_SIMILARITY = 0.70         # every distinctive word must be at least this close
 MIN_MEANINGFUL_WORDS = 2            # fewer place words than this -> address too vague
+
+# Stage 3: Offline Spelling Validation Configuration
+SPELLING_ERROR_THRESHOLD = 0.82     # Ratio >= 0.82 to known name classified as SPELLING_ERROR
+SPELLING_UNCERTAIN_MIN = 0.75       # Ratio in [0.75, 0.82) classified as SPELLING_UNCERTAIN
+SPELLING_UNCERTAIN_POLICY = "PROCEED"  # "PROCEED" allows uncertain to proceed to geocoding; "STOP" halts
 
 # Incomplete address detection constraints (3 constraints only)
 MIN_ADDRESS_CHARS = 15              # Constraint 1: minimum total characters
@@ -130,9 +143,6 @@ STOPWORDS = {
     "the", "of", "and", "in", "at", "to", "for", "from",
     "near", "nr", "opp", "opposite", "behind", "beside",
 }
-
-# Configurable spelling uncertainty handling policy: "PROCEED" (continue to geocode) or "STOP"
-SPELLING_UNCERTAIN_POLICY = "PROCEED"
 
 # Geometry
 PRECISE_GEOCODE_TYPES = {"ROOFTOP", "RANGE_INTERPOLATED"}
@@ -151,7 +161,8 @@ MAX_PLACES_CANDIDATES = 5
 # Output
 # --------------------------------------------------------------------------
 OUTPUT_COLUMNS = [
-    "input_row", "soa_loan_no", "address_column", "original_address", "sanitized_address", "normalized_address",
+    "input_row", "soa_loan_no", "address_column", "original_address", "sanitized_address",
+    "normalized_address",
     "address_length", "major_word_count", "pincode_list", "pincode_count",
     "address_completeness_status", "address_issue_category",
     "spelling_error_detected", "suspected_misspelled_words", "suggested_spelling_corrections",
@@ -169,9 +180,10 @@ ERROR_DERIVATION = "PROCESSING_ERROR"
 
 # Flags that mean "a human should look at this row"
 REVIEW_FLAGS = {"GEOCODE_UNVERIFIED", "PIN_MISMATCH", "PIN_MISMATCH_CORROBORATED",
-                "POI_PIN_MISMATCH", "POI_GEOCODE_DISAGREE", "DOUBLE_PINCODE", "CONFLICTING_PINCODES",
-                "ADDRESS_TRUNCATED", "INCOMPLETE_ADDRESS", "MISSING_PINCODE", "TOO_FEW_WORDS",
-                "ADDRESS_TOO_SHORT", "SPELLING_ERROR", "SPELLING_UNCERTAIN", ERROR_DERIVATION}
+                "POI_PIN_MISMATCH", "POI_GEOCODE_DISAGREE", "DOUBLE_PINCODE", "MULTIPLE_PINCODES",
+                "CONFLICTING_PINCODES", "ADDRESS_TRUNCATED", "INCOMPLETE_ADDRESS",
+                "MISSING_PINCODE", "TOO_FEW_WORDS", "ADDRESS_TOO_SHORT", "SPELLING_ERROR",
+                "SPELLING_UNCERTAIN", ERROR_DERIVATION}
 
 
 class ApiAbort(Exception):
@@ -292,304 +304,6 @@ def check_address_completeness(address: str, min_len: int = MIN_ADDRESS_CHARS, m
         subcat = "_".join(fails)
 
     return True, subcat, fails, major_words, pins
-
-
-def score_incomplete(subcat: str, fails: list) -> int:
-    """Deterministically assign a confidence score between 0 and 9 for incomplete addresses."""
-    if subcat in ("INVALID_INPUT", "EMPTY_ADDRESS") or not fails:
-        return 0
-    if subcat == "ALL_CRITERIA_FAILED":
-        return 1
-    if len(fails) > 1:
-        return 3
-    if subcat in ("MISSING_PINCODE", "PINCODE_MISSING"):
-        return 5
-    if subcat in ("TOO_FEW_WORDS", "INSUFFICIENT_MAJOR_WORDS"):
-        return 7
-    if subcat == "ADDRESS_TOO_SHORT":
-        return 8
-    return 5
-
-
-def score_conflicting_pincodes(unique_pins) -> int:
-    """Assign deterministic score between 11 and 20 for conflicting pincodes."""
-    count = len(unique_pins)
-    if count == 2:
-        return 15
-    elif count > 2:
-        return 12
-    return 15
-
-
-def score_spelling_error(suspected_words: list, suggested_corrections: list) -> int:
-    """Assign deterministic score between 21 and 30 for detected spelling errors."""
-    if len(suspected_words) >= 2:
-        return 22
-    return 25
-
-
-def score_synonym_normalization(terms_count: int) -> int:
-    """Assign preprocessing score between 60 and 70 when synonym normalization is applied."""
-    if terms_count >= 3:
-        return 68
-    elif terms_count == 2:
-        return 65
-    return 62
-
-
-# --------------------------------------------------------------------------
-# Stage 3: Geographic Names Dictionary & Offline Spelling Detection
-# --------------------------------------------------------------------------
-KNOWN_STATES = {
-    "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh",
-    "goa", "gujarat", "haryana", "himachal pradesh", "jharkhand", "karnataka",
-    "kerala", "madhya pradesh", "maharashtra", "manipur", "meghalaya", "mizoram",
-    "nagaland", "odisha", "punjab", "rajasthan", "sikkim", "tamil nadu",
-    "telangana", "tripura", "uttar pradesh", "uttarakhand", "west bengal",
-    "delhi", "chandigarh", "puducherry", "ladakh", "jammu and kashmir"
-}
-
-KNOWN_CITIES = {
-    "mumbai", "delhi", "bengaluru", "bangalore", "hyderabad", "ahmedabad", "chennai", "madras",
-    "kolkata", "calcutta", "surat", "pune", "jaipur", "lucknow", "kanpur", "nagpur", "indore",
-    "thane", "bhopal", "visakhapatnam", "vadodara", "baroda", "firozabad", "ludhiana", "rajkot",
-    "agra", "siliguri", "nashik", "faridabad", "patiala", "meerut", "kalyan", "dombivli",
-    "varanasi", "srinagar", "dhanbad", "jodhpur", "amritsar", "raipur", "allahabad", "prayagraj",
-    "coimbatore", "jabalpur", "gwalior", "vijayawada", "madurai", "guwahati", "chandigarh",
-    "hubli", "dharwad", "amravati", "noida", "gurgaon", "gurugram", "aligarh", "solapur",
-    "ranchi", "jalandhar", "tiruchirappalli", "bhubaneswar", "salem", "warangal", "mira bhayandar",
-    "thiruvananthapuram", "trivandrum", "bhiwandi", "saharanpur", "guntur", "bikaner", "amroha",
-    "jamshedpur", "bhilai", "cuttack", "kochi", "cochin", "udaipur", "dehradun", "asansol",
-    "nanded", "ajmer", "jamnagar", "uujjain", "loni", "jhansi", "ulhasnagar", "jammu", "sangli",
-    "mangalore", "mangaluru", "erode", "belgaum", "belagavi", "kurnool", "ambattur", "tirunelveli",
-    "malegaon", "gaya", "jalgaon", "maheshtala", "davanagere", "kozhikode", "calicut",
-    "rajahmundry", "bokaro", "south dumdum", "bellary", "gopalpur", "agartala", "bhagalpur",
-    "muzaffarnagar", "bhatpara", "panihati", "latur", "dhule", "rohtak", "korba", "bhilwara",
-    "berhampur", "muzaffarpur", "ahmednagar", "mathura", "kollam", "avadi", "kadapa",
-    "kamarhati", "sambalpur", "bilaspur", "shahjahanpur", "satara", "bijapur", "rampur",
-    "shivamogga", "shimoga", "chandrapur", "junagadh", "thrissur", "alwar", "bardhaman",
-    "kakinada", "nizamabad", "parbhani", "tumkur", "tumakuru", "hisar", "panipat", "darbhanga",
-    "aizawl", "dewas", "ichalkaranji", "karnal", "bathinda", "jalna", "eluru", "barasat",
-    "purnia", "satna", "mau", "sonipat", "farrukhabad", "sagar", "rourkela", "durg", "imphal",
-    "ratlam", "hapur", "arrah", "karimnagar", "anantapur", "etawah", "ambernath", "bharatpur",
-    "begusarai", "new delhi", "gandhidham", "gandhinagar", "shimla", "anand", "morbi",
-    "surendranagar", "palanpur", "patan", "valsad", "vapi", "navsari", "bharuch", "porbandar",
-    "godhra", "dahod", "veraval", "mehsana", "kadi", "kalol", "sidhpur", "visnagar"
-}
-
-KNOWN_COMMON_TERMS = {
-    "road", "street", "lane", "gali", "marg", "chowk", "chauraha", "circle", "crossing",
-    "cross", "junction", "naka", "gate", "bridge", "flyover", "sector", "block", "phase",
-    "nagar", "colony", "society", "enclave", "vihar", "layout", "apartment", "apartments",
-    "flat", "plot", "house", "floor", "building", "tower", "complex", "plaza", "bhavan",
-    "hospital", "clinic", "school", "college", "university", "academy", "temple", "mandir",
-    "masjid", "mosque", "church", "gurudwara", "ashram", "bank", "office", "police",
-    "station", "market", "bazaar", "shop", "store", "hotel", "petrol", "pump", "post",
-    "village", "taluka", "district", "highway", "bypass"
-}
-
-VALID_ALTERNATIVES = {
-    "bengaluru": {"bangalore"},
-    "bangalore": {"bengaluru"},
-    "mumbai": {"bombay"},
-    "bombay": {"mumbai"},
-    "chennai": {"madras"},
-    "madras": {"chennai"},
-    "kolkata": {"calcutta"},
-    "calcutta": {"kolkata"},
-    "vadodara": {"baroda"},
-    "baroda": {"vadodara"},
-    "gurugram": {"gurgaon"},
-    "gurgaon": {"gurugram"},
-    "prayagraj": {"allahabad"},
-    "allahabad": {"prayagraj"},
-    "puducherry": {"pondicherry"},
-    "pondicherry": {"puducherry"},
-    "belagavi": {"belgaum"},
-    "belgaum": {"belagavi"},
-    "kalaburagi": {"gulbarga"},
-    "gulbarga": {"kalaburagi"},
-    "mangaluru": {"mangalore"},
-    "mangalore": {"mangaluru"},
-    "thiruvananthapuram": {"trivandrum"},
-    "trivandrum": {"thiruvananthapuram"},
-    "kozhikode": {"calicut"},
-    "calicut": {"kozhikode"},
-    "vijayawada": {"bezawada"},
-    "bezawada": {"vijayawada"},
-    "mysuru": {"mysore"},
-    "mysore": {"mysuru"},
-    "shivamogga": {"shimoga"},
-    "shimoga": {"shivamogga"},
-    "tumakuru": {"tumkur"},
-    "tumkur": {"tumakuru"},
-}
-
-KNOWN_TYPOS = {
-    "mumbay": "mumbai",
-    "mumbaee": "mumbai",
-    "delhy": "delhi",
-    "bengaluruu": "bengaluru",
-    "banglore": "bangalore",
-    "chenay": "chennai",
-    "chennaee": "chennai",
-    "kolkatta": "kolkata",
-    "ahmedbad": "ahmedabad",
-    "ahemedabad": "ahmedabad",
-    "punei": "pune",
-    "jaipoor": "jaipur",
-    "gandhinagr": "gandhinagar",
-    "hospitl": "hospital",
-    "hosptal": "hospital",
-    "haspatal": "hospital",
-    "scool": "school",
-    "aprtment": "apartment",
-    "apratment": "apartment",
-    "templee": "temple",
-    "mandeer": "mandir",
-    "roadd": "road",
-    "stret": "street",
-    "streett": "street",
-    "coloney": "colony",
-    "sociaty": "society",
-    "soceity": "society",
-    "bazar": "bazaar",
-    "markit": "market",
-}
-
-ALL_KNOWN_WORDS = KNOWN_STATES | KNOWN_CITIES | KNOWN_COMMON_TERMS
-
-DICT_BY_LEN = defaultdict(list)
-for _w in ALL_KNOWN_WORDS:
-    DICT_BY_LEN[len(_w)].append(_w)
-
-
-@functools.lru_cache(maxsize=50_000)
-def check_token_spelling(token: str):
-    """Cached per-token spelling check against known geographic and structural words."""
-    if token in KNOWN_TYPOS:
-        return True, False, KNOWN_TYPOS[token]
-
-    if token in ALL_KNOWN_WORDS:
-        return False, False, None
-
-    if any(token in alts for alts in VALID_ALTERNATIVES.values()):
-        return False, False, None
-
-    t_len = len(token)
-    if t_len < 4:
-        return False, False, None
-
-    t_set = set(token)
-    best_match = None
-    best_sim = 0.0
-
-    candidates = DICT_BY_LEN.get(t_len - 1, []) + DICT_BY_LEN.get(t_len, []) + DICT_BY_LEN.get(t_len + 1, [])
-    for cand in candidates:
-        if len(t_set & set(cand)) < t_len - 1:
-            continue
-        sim = _sim(token, cand)
-        if sim > best_sim:
-            best_sim = sim
-            best_match = cand
-
-    if best_sim >= 0.85 and best_sim < 1.0 and best_match:
-        if best_match in VALID_ALTERNATIVES and token in VALID_ALTERNATIVES[best_match]:
-            return False, False, None
-        if t_len >= 5 and best_sim >= 0.85:
-            return True, False, best_match
-        elif t_len >= 4 and best_sim >= 0.88:
-            return False, True, best_match
-
-    return False, False, None
-
-
-def detect_spelling_errors(address: str, threshold: float = 0.85):
-    """
-    Stage 3: Detect likely spelling errors in meaningful address components before geocoding.
-    Returns (has_error: bool, is_uncertain: bool, suspected_words: list, suggested_corrections: list)
-    """
-    cleaned = re.sub(r"[^\w\s]", " ", str(address)).replace("_", " ").lower()
-    tokens = [t for t in cleaned.split() if len(t) >= 4 and not t.isdigit()]
-
-    suspected = []
-    corrections = []
-    uncertain = []
-
-    for t in tokens:
-        is_err, is_unc, corr = check_token_spelling(t)
-        if is_err:
-            if t not in suspected:
-                suspected.append(t)
-                corrections.append(corr)
-        elif is_unc:
-            if t not in [u[0] for u in uncertain]:
-                uncertain.append((t, corr))
-
-    has_error = len(suspected) > 0
-    is_uncertain = len(uncertain) > 0 and not has_error
-    return has_error, is_uncertain, suspected, corrections
-
-
-# --------------------------------------------------------------------------
-# Stage 4: Synonym & Entity Normalization
-# --------------------------------------------------------------------------
-SYNONYM_RULES = [
-    (r"\bmandir\b", "temple"),
-    (r"\bmandar\b", "temple"),
-    (r"\bdevasthan\b", "temple"),
-    (r"\brd\b", "road"),
-    (r"\brd\.\b", "road"),
-    (r"\bst\b", "street"),
-    (r"\bst\.\b", "street"),
-    (r"\bmrg\b", "marg"),
-    (r"\bsoc\b", "society"),
-    (r"\bsoc\.\b", "society"),
-    (r"\bapt\b", "apartment"),
-    (r"\bapts\b", "apartments"),
-    (r"\bapt\.\b", "apartment"),
-    (r"\bbldg\b", "building"),
-    (r"\bbldg\.\b", "building"),
-    (r"\bhosp\b", "hospital"),
-    (r"\bhosp\.\b", "hospital"),
-    (r"\bsch\b", "school"),
-    (r"\bclg\b", "college"),
-    (r"\buniv\b", "university"),
-    (r"\bgovt\b", "government"),
-    (r"\bgovt\.\b", "government"),
-    (r"\bpvt\b", "private"),
-    (r"\bpvt\.\b", "private"),
-    (r"\bltd\b", "limited"),
-    (r"\bltd\.\b", "limited"),
-    (r"\bco\s*op(?:erative)?\b", "co operative"),
-    (r"\bdist\b", "district"),
-    (r"\bdist\.\b", "district"),
-    (r"\bopp\b", "opposite"),
-    (r"\bopp\.\b", "opposite"),
-    (r"\bnr\b", "near"),
-    (r"\bnr\.\b", "near"),
-    (r"\bbh\b", "behind"),
-    (r"\bbh\.\b", "behind"),
-    (r"\bstn\b", "station"),
-    (r"\bmkt\b", "market"),
-]
-
-
-def normalize_synonyms(address: str):
-    """
-    Stage 4: Normalize equivalent words and expressions before geocoding.
-    Returns (normalized_address: str, applied: bool, normalized_terms: str)
-    """
-    s = address
-    applied = []
-    for pattern, repl in SYNONYM_RULES:
-        new_s, count = re.subn(pattern, repl, s, flags=re.IGNORECASE)
-        if count > 0 and new_s != s:
-            from_term = pattern.replace(r"\b", "").replace(r"\.", "").replace(r"\s*", " ")
-            applied.append(f"{from_term}->{repl}")
-            s = new_s
-    s = re.sub(r"\s+", " ", s).strip()
-    return s, bool(applied), ";".join(applied)
 
 
 def haversine_m(lat1, lng1, lat2, lng2) -> float:
@@ -733,6 +447,278 @@ POSTPOSITION_WORDS = {"samne", "same", "paas", "pass", "pase", "baju", "bajuma",
                       "wali", "wale", "wala"}
 LANDMARK_WORDS = LANDMARK_INTRO_WORDS | POSTPOSITION_WORDS
 
+# --------------------------------------------------------------------------
+# Stage 4: Synonym & Entity Normalization Dictionary
+# --------------------------------------------------------------------------
+SYNONYM_DICT = {
+    # Religious / Landmarks
+    "mandir": "temple",
+    "mandiram": "temple",
+    "mandeer": "temple",
+    "mandiir": "temple",
+    "devasthan": "temple",
+    "devalaya": "temple",
+    "shivalaya": "temple",
+    "thakurbari": "temple",
+    "kovil": "temple",
+    "koil": "temple",
+    "masjid": "mosque",
+    "majid": "mosque",
+    "masjeed": "mosque",
+    "girja": "church",
+    "gurudwara": "gurdwara",
+    "gurudawara": "gurdwara",
+    # Road / Thoroughfare
+    "rd": "road",
+    "st": "street",
+    "strt": "street",
+    "ave": "avenue",
+    "av": "avenue",
+    "mrg": "marg",
+    "ln": "lane",
+    "blvd": "boulevard",
+    "rasta": "road",
+    "salai": "road",
+    "sarani": "road",
+    "byepass": "bypass",
+    # Buildings / Housing
+    "bldg": "building",
+    "bldng": "building",
+    "apt": "apartment",
+    "apts": "apartments",
+    "appartments": "apartments",
+    "appartment": "apartment",
+    "soc": "society",
+    "cmplx": "complex",
+    "cplx": "complex",
+    "hsg": "housing",
+    "clny": "colony",
+    "col": "colony",
+    "twr": "tower",
+    "twrs": "towers",
+    "ht": "heights",
+    "hts": "heights",
+    "encl": "enclave",
+    "vil": "village",
+    "vill": "village",
+    # Institutions / Commerce
+    "hosp": "hospital",
+    "haspatal": "hospital",
+    "aspatal": "hospital",
+    "disp": "dispensary",
+    "univ": "university",
+    "coll": "college",
+    "inst": "institute",
+    "acad": "academy",
+    "sch": "school",
+    "vid": "vidyalaya",
+    "vidy": "vidyalaya",
+    "stn": "station",
+    "rly": "railway",
+    "po": "post office",
+    "ps": "police station",
+    "mkt": "market",
+    "bazar": "bazaar",
+    "shwrm": "showroom",
+    "ltd": "limited",
+    "pvt": "private",
+    # Administrative
+    "govt": "government",
+    "dist": "district",
+    "dt": "district",
+    "tal": "taluka",
+    "tk": "taluk",
+    "teh": "tehsil",
+    "sec": "sector",
+    "blk": "block",
+    "flr": "floor",
+    # Orientations / Directions
+    "opp": "opposite",
+    "nr": "near",
+    "adj": "adjacent",
+    "bh": "behind",
+}
+
+
+def normalize_synonyms(address: str, synonym_dict: dict = SYNONYM_DICT):
+    """
+    Stage 4: Normalize synonymous and equivalent terms before geocoding.
+    Returns:
+        (normalized_address: str, was_normalized: bool, normalized_terms: list[str])
+    """
+    if not address:
+        return "", False, []
+
+    normalized_terms = []
+
+    def replace_word(match):
+        word = match.group(0)
+        lower_word = word.lower()
+        if lower_word in synonym_dict:
+            canon = synonym_dict[lower_word]
+            if canon.lower() != lower_word:
+                if word.isupper():
+                    rep = canon.upper()
+                elif word[0].isupper():
+                    rep = canon.capitalize()
+                else:
+                    rep = canon
+                normalized_terms.append(f"{lower_word} -> {canon}")
+                return rep
+        return word
+
+    norm_addr = re.sub(r"\b[A-Za-z]+(?:\.[A-Za-z]+)*\b", replace_word, str(address))
+    unique_terms = list(dict.fromkeys(normalized_terms))
+    was_normalized = len(unique_terms) > 0
+    return norm_addr, was_normalized, unique_terms
+
+
+# --------------------------------------------------------------------------
+# Stage 3: Offline Geographic Names Dictionary & Spelling Error Detection
+# --------------------------------------------------------------------------
+KNOWN_GEO_NAMES = {
+    # 28 States & 8 UTs (single words & component words)
+    "andhra", "pradesh", "arunachal", "assam", "bihar", "chhattisgarh", "goa", "gujarat",
+    "haryana", "himachal", "jharkhand", "karnataka", "kerala", "madhya", "maharashtra",
+    "manipur", "meghalaya", "mizoram", "nagaland", "odisha", "punjab", "rajasthan",
+    "sikkim", "tamil", "nadu", "telangana", "tripura", "uttar", "uttarakhand",
+    "bengal", "delhi", "jammu", "kashmir", "ladakh", "andaman", "nicobar", "chandigarh",
+    "dadra", "nagar", "haveli", "daman", "diu", "lakshadweep", "puducherry",
+    # Top 150+ Indian Cities & Districts
+    "mumbai", "bombay", "bengaluru", "bangalore", "hyderabad", "ahmedabad", "chennai", "madras",
+    "kolkata", "calcutta", "surat", "pune", "poona", "jaipur", "lucknow", "kanpur", "nagpur",
+    "indore", "thane", "bhopal", "visakhapatnam", "vizag", "patna", "vadodara", "baroda",
+    "ghaziabad", "ludhiana", "agra", "nashik", "faridabad", "meerut", "rajkot", "kalyan",
+    "dombivli", "vasai", "virar", "varanasi", "srinagar", "aurangabad", "dhanbad", "amritsar",
+    "allahabad", "prayagraj", "howrah", "ranchi", "gwalior", "jabalpur", "coimbatore",
+    "vijayawada", "jodhpur", "madurai", "raipur", "kota", "guwahati", "solapur", "hubli",
+    "dharwad", "hubballi", "bareilly", "moradabad", "mysore", "mysuru", "gurgaon", "gurugram",
+    "aligarh", "jalandhar", "tiruchirappalli", "trichy", "bhubaneswar", "salem", "bhayandar",
+    "warangal", "thiruvananthapuram", "trivandrum", "bhiwandi", "saharanpur", "gorakhpur",
+    "guntur", "bikaner", "amravati", "noida", "jamshedpur", "bhilai", "cuttack", "firozabad",
+    "kochi", "cochin", "nellore", "bhavnagar", "dehradun", "durgapur", "asansol", "rourkela",
+    "nanded", "kolhapur", "ajmer", "akola", "gulbarga", "kalaburagi", "jamnagar", "ujjain",
+    "loni", "siliguri", "jhansi", "ulhasnagar", "sangli", "mangalore", "mangaluru", "erode",
+    "belgaum", "belagavi", "kurnool", "ambattur", "tirunelveli", "malegaon", "gaya", "tiruppur",
+    "davanagere", "kozhikode", "calicut", "mehsana", "kadi", "anand", "navsari", "vapi",
+    "gandhinagar", "himatnagar", "palanpur", "porbandar", "bharuch", "valsad", "mathura",
+    "vrindavan", "alwar", "bharatpur", "rohtak", "hisar", "panipat", "karnal", "sonipat",
+    "ambala", "bathinda", "pathankot", "hoshiarpur", "shimla", "iglas", "hathras", "kasganj",
+    "mainpuri", "shikohabad", "tundla", "fatehabad", "bulandshahr", "khurja", "sikandrabad",
+    # Prominent Localities / Suburbs
+    "andheri", "bandra", "borivali", "malad", "kandivali", "ghatkopar", "kurla", "chembur",
+    "dadar", "colaba", "juhu", "powai", "mulund", "bhandup", "goregaon", "jogeshwari",
+    "santacruz", "khar", "matunga", "sion", "wadala", "parel", "worli", "byculla", "mazgaon",
+    "girgaon", "walkeshwar", "mahalaxmi", "chincholi", "bunder", "lokhandwala", "versova",
+    "oshiwara", "marol", "dharavi", "mahim", "koramangala", "indiranagar", "jayanagar",
+    "whitefield", "marathahalli", "hennur", "hebbal", "yelahanka", "banashankari",
+    "rajajinagar", "malleshwaram", "basavanagudi", "ulsoor", "bellandur", "anekal", "jigani",
+    "bommasandra", "vadapalani", "velachery", "mylapore", "thiruvanmiyur", "guindy",
+    "tambaram", "chromepet", "porur", "alwarpet", "nungambakkam", "egmore", "royapettah",
+    "kilpauk", "perambur", "kodambakkam", "kavarai", "madhapur", "gachibowli", "secunderabad",
+    "kukatpally", "dilsukhnagar", "charminar", "begumpet", "ameerpet", "kondapur", "miyapur",
+    "navrangpura", "satellite", "bodakdev", "vastrapur", "paldi", "maninagar", "naroda",
+    "bapunagar", "chandkheda", "gota", "thaltej", "belanganj", "tinbatti",
+    # Common Geographic Entity Words & Suffixes
+    "road", "street", "marg", "rasta", "galli", "gali", "lane", "avenue", "drive", "highway",
+    "expressway", "bypass", "chowk", "square", "circle", "crossing", "chauraha", "tiraha",
+    "naka", "gate", "dwar", "nagar", "pur", "puri", "puram", "vihar", "enclave", "colony",
+    "society", "layout", "apartment", "apartments", "residency", "complex", "arcade",
+    "plaza", "tower", "towers", "heights", "estate", "park", "garden", "nagari", "palli",
+    "halli", "gaon", "gram", "kheda", "taluk", "taluka", "tehsil", "district", "market",
+    "bazaar", "bazar", "bunder", "point", "corner", "block", "sector", "phase",
+}
+
+VALID_ALTERNATIVES = {
+    "bengaluru": {"bangalore"}, "bangalore": {"bengaluru"},
+    "mumbai": {"bombay"}, "bombay": {"mumbai"},
+    "kolkata": {"calcutta"}, "calcutta": {"kolkata"},
+    "chennai": {"madras"}, "madras": {"chennai"},
+    "vadodara": {"baroda"}, "baroda": {"vadodara"},
+    "pune": {"poona"}, "poona": {"pune"},
+    "kochi": {"cochin"}, "cochin": {"kochi"},
+    "thiruvananthapuram": {"trivandrum"}, "trivandrum": {"thiruvananthapuram"},
+    "kozhikode": {"calicut"}, "calicut": {"kozhikode"},
+    "varanasi": {"banaras", "benares", "kashi"},
+    "prayagraj": {"allahabad"}, "allahabad": {"prayagraj"},
+    "gurugram": {"gurgaon"}, "gurgaon": {"gurugram"},
+    "mysuru": {"mysore"}, "mysore": {"mysuru"},
+    "belagavi": {"belgaum"}, "belgaum": {"belagavi"},
+    "hubballi": {"hubli"}, "hubli": {"hubballi"},
+    "kalaburagi": {"gulbarga"}, "gulbarga": {"kalaburagi"},
+    "mangalore": {"mangaluru"}, "mangaluru": {"mangalore"},
+    "puducherry": {"pondicherry"}, "pondicherry": {"puducherry"},
+    "odisha": {"orissa"}, "orissa": {"odisha"},
+    "chhatrapati sambhajinagar": {"aurangabad"}, "aurangabad": {"chhatrapati sambhajinagar"},
+    "wadi": {"vadi"}, "vadi": {"wadi"},
+    "pur": {"pore"}, "pore": {"pur"},
+}
+
+
+def detect_spelling_errors(address: str, known_names: set = KNOWN_GEO_NAMES,
+                           error_threshold: float = SPELLING_ERROR_THRESHOLD,
+                           uncertain_min: float = SPELLING_UNCERTAIN_MIN):
+    """
+    Stage 3: Offline spelling error detection on geographic words.
+    Returns:
+        (has_error: bool, suspected_words: list[str], suggestions: list[str],
+         is_uncertain: bool, confidence_score: int)
+    """
+    major_words = get_major_words(address)
+    suspected_errors = []
+    suggested_corrections = []
+    uncertain_words = []
+    uncertain_suggestions = []
+    max_sim_found = 0.0
+
+    for word in major_words:
+        w_low = word.lower()
+        if len(w_low) < 4:
+            continue
+        # Exact match to known names or common vocabulary
+        if w_low in known_names or w_low in POI_GENERIC_WORDS or w_low in SYNONYM_DICT:
+            continue
+        # Recognized valid alternate transliteration / historical name
+        is_alt = False
+        for canon, alts in VALID_ALTERNATIVES.items():
+            if w_low == canon or w_low in alts:
+                is_alt = True
+                break
+        if is_alt:
+            continue
+
+        # Search for close matches in known names
+        best_k = None
+        best_sim = 0.0
+        for k in known_names:
+            if abs(len(w_low) - len(k)) > 2:
+                continue
+            s = _sim(w_low, k)
+            if s > best_sim:
+                best_sim = s
+                best_k = k
+
+        if best_sim >= error_threshold and best_k != w_low:
+            suspected_errors.append(word)
+            suggested_corrections.append(best_k)
+            if best_sim > max_sim_found:
+                max_sim_found = best_sim
+        elif best_sim >= uncertain_min and best_k != w_low:
+            uncertain_words.append(word)
+            uncertain_suggestions.append(best_k)
+
+    if suspected_errors:
+        # Scale confidence score in 21-30 band based on similarity
+        span = SCORE_SPELLING_MAX - SCORE_SPELLING_MIN
+        frac = min(1.0, max(0.0, (max_sim_found - error_threshold) / (1.0 - error_threshold)))
+        score = SCORE_SPELLING_MIN + int(frac * span)
+        return True, suspected_errors, suggested_corrections, False, score
+
+    if uncertain_words:
+        return False, uncertain_words, uncertain_suggestions, True, SCORE_SPELLING_MIN
+
+    return False, [], [], False, 0
+
 
 # --------------------------------------------------------------------------
 # Persistent API cache (SQLite)
@@ -827,7 +813,7 @@ class ApiClient:
         self.max_api_calls = max_api_calls
         self.session = session or requests.Session()
         self._sleep = sleep
-        self.stats = {"api_calls": 0, "cache_hits": 0, "geocode_calls": 0, "places_calls": 0}
+        self.stats = {"api_calls": 0, "cache_hits": 0}
 
     # -- public -----------------------------------------------------------
     def geocode(self, address: str) -> dict:
@@ -835,7 +821,7 @@ class ApiClient:
         key = f"geo3|{self.region}|{norm}"
         legacy = f"geo2|{self.region}||{norm}"         # entries written by the v1 script
         params = {"address": address, "region": self.region, "language": "en"}
-        return self._get(GEOCODING_URL, params, key, [legacy], _trim_geocode, call_type="geocode")
+        return self._get(GEOCODING_URL, params, key, [legacy], _trim_geocode)
 
     def places(self, query: str, bias=None, radius=None) -> dict:
         norm = _normalize(query)
@@ -849,7 +835,7 @@ class ApiClient:
         legacy = []
         if not bias or params.get("radius") == 5000:   # v1 only ever used a 5 km radius
             legacy = [f"places3|{self.region}|{loc}|{norm}"]
-        return self._get(PLACES_TEXT_SEARCH_URL, params, key, legacy, _trim_places, call_type="places")
+        return self._get(PLACES_TEXT_SEARCH_URL, params, key, legacy, _trim_places)
 
     # -- internals ---------------------------------------------------------
     def _redact(self, text) -> str:
@@ -862,12 +848,12 @@ class ApiClient:
         delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (2 ** attempt)) + extra
         self._sleep(delay + random.uniform(0, 0.5))
 
-    def _get(self, url, params, key, legacy_keys, trim, call_type="geocode"):
+    def _get(self, url, params, key, legacy_keys, trim):
         if self.cache is not None:
             for k in [key] + list(legacy_keys):
                 cached = self.cache.get(k)
                 if cached is not None:
-                    self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
+                    self.stats["cache_hits"] += 1
                     return cached
         if self.cache_only:
             raise CacheMiss(key)
@@ -877,13 +863,9 @@ class ApiClient:
         full = dict(params, key=self.api_key)
         last_error = "unknown error"
         for attempt in range(MAX_RETRIES):
-            if self.max_api_calls is not None and self.stats.get("api_calls", 0) >= self.max_api_calls:
+            if self.max_api_calls is not None and self.stats["api_calls"] >= self.max_api_calls:
                 raise ApiAbort(f"--max-api-calls budget of {self.max_api_calls} reached")
-            self.stats["api_calls"] = self.stats.get("api_calls", 0) + 1
-            if call_type == "geocode":
-                self.stats["geocode_calls"] = self.stats.get("geocode_calls", 0) + 1
-            else:
-                self.stats["places_calls"] = self.stats.get("places_calls", 0) + 1
+            self.stats["api_calls"] += 1
             try:
                 resp = self.session.get(url, params=full, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S))
             except requests.exceptions.RequestException as e:
@@ -1136,8 +1118,7 @@ def evaluate_place(place: dict, ctx: AddrCtx) -> PlaceEval:
 
 
 # --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
-# Combine both stages
+# Combine all stages
 # --------------------------------------------------------------------------
 def _blank_result(**kw) -> dict:
     res = {
@@ -1146,24 +1127,26 @@ def _blank_result(**kw) -> dict:
         "distance_m": None, "confidence_score": 0, "recommended_geofence_m": None,
         "place_name": None, "place_types": None, "formatted_address": "",
         "verification": "", "flags": [],
-        # inputs for the remarks column
-        "typos": [], "variants": [], "place_reject": None, "underlying": None, "pins": [],
-        # Stage 1-6 pipeline attributes
+        # Stage & Validation fields
         "processing_stage": "",
         "match_classification": "",
         "address_completeness_status": "COMPLETE",
         "address_issue_category": "NONE",
+        "original_address": "",
+        "address_length": 0,
+        "major_word_count": 0,
+        "pincode_list": "",
+        "pincode_count": 0,
         "spelling_error_detected": False,
-        "suspected_misspelled_words": [],
-        "suggested_spelling_corrections": [],
+        "suspected_misspelled_words": "",
+        "suggested_spelling_corrections": "",
         "normalized_address": "",
         "synonym_normalization_applied": False,
         "normalized_terms": "",
-        "synonym_score": None,
         "geocoding_api_called": False,
         "places_api_called": False,
-        "major_words": [],
-        "completeness_details": None,
+        # inputs for the remarks column
+        "typos": [], "variants": [], "place_reject": None, "underlying": None, "pins": [],
     }
     res.update(kw)
     return res
@@ -1193,164 +1176,174 @@ def spelling_variants(ctx: AddrCtx, formatted_address: str, limit: int = 3):
 
 def derive_coordinates_with_confidence(address: str, client) -> dict:
     """
-    Cost-Optimized Multi-Stage Address Validation, Classification & Geocoding Pipeline:
-      Stage 1: Incomplete Address Detection (Score: 0-9, NO API)
-      Stage 2: Duplicate or Conflicting PIN Code Detection (Score: 11-20, NO API)
-      Stage 3: Spelling Mistake Detection (Score: 21-30, NO API)
-      Stage 4: Synonym and Entity Normalization (Score: 60-70 preprocessing, PROCEED to API)
-      Stage 5: Verified POI Exact Match (Score: 90-99, Geocoding + Places API fallback)
-      Stage 6: Strict Exact Match (Score: 100, Geocoding API ROOFTOP)
+    6-stage cost-optimized address validation, classification & geocoding pipeline:
+      Stage 1: Incomplete Address Detection (score 0-9, NO API calls)
+      Stage 2: Duplicate / Conflicting PIN Code Detection (score 11-20, NO API calls)
+      Stage 3: Offline Spelling Mistake Detection (score 21-30, NO API calls)
+      Stage 4: Synonym & Entity Normalization (score 60-70 preprocessing, CONTINUE to API)
+      Stage 5: Google Geocoding & Places Fallback (POI exact 90-99, Landmark 70-80)
+      Stage 6: Strict Exact Match (ROOFTOP + partial_match=False + verified -> 100)
     """
-    # ----------------------------------------------------------------------
-    # STAGE 1: Incomplete Address Detection (0-9, NO API calls)
-    # ----------------------------------------------------------------------
+    return _derive_core(address, client)
+
+
+def _derive_core(address: str, client) -> dict:
+    """Execute the 6-stage sequential validation, normalization & geocoding pipeline."""
+    # Stage 1: Incomplete Address Detection (score 0-9, NO API calls)
     is_inc, subcat, fails, major_words, pins = check_address_completeness(address)
+    pin_list_str = ", ".join(sorted(pins))
     if is_inc:
-        score = score_incomplete(subcat, fails)
         flags = ["INCOMPLETE_ADDRESS"] + [f for f in fails if f != "INCOMPLETE_ADDRESS"]
-        issue_cat = subcat
-        if len(fails) > 1 and subcat not in ("ALL_CRITERIA_FAILED", "TOO_SHORT_AND_FEW_WORDS"):
-            issue_cat = f"MULTIPLE_COMPLETENESS_FAILURES ({subcat})"
+        inc_score = INCOMPLETE_SUBCAT_SCORES.get(subcat, 5)
         res = _blank_result(
             status="INCOMPLETE_ADDRESS",
             source_api="VALIDATION_RULE",
             derivation_type=f"INCOMPLETE_ADDRESS ({subcat})",
             category="INCOMPLETE_ADDRESS",
-            confidence_score=score,
-            recommended_geofence_m=geofence_for_score(score),
+            match_classification="INCOMPLETE_ADDRESS",
+            processing_stage="STAGE_1_INCOMPLETE_DETECTION",
+            confidence_score=inc_score,
+            recommended_geofence_m=geofence_for_score(inc_score),
             flags=flags,
             verification="INCOMPLETE",
             pins=sorted(pins),
-            major_words=major_words,
-            processing_stage="STAGE_1_INCOMPLETE",
-            match_classification="INCOMPLETE_ADDRESS",
+            pincode_list=pin_list_str,
+            pincode_count=len(pins),
+            address_length=len(address),
+            major_word_count=len(major_words),
             address_completeness_status="INCOMPLETE",
-            address_issue_category=issue_cat,
+            address_issue_category=subcat,
+            original_address=address,
+            normalized_address=address,
             geocoding_api_called=False,
             places_api_called=False,
-            completeness_details={
-                "subcat": subcat,
-                "fails": fails,
-                "length": len(address),
-                "major_words": major_words,
-                "pins": list(pins),
-            }
         )
+        res["completeness_details"] = {
+            "subcat": subcat,
+            "fails": fails,
+            "length": len(address),
+            "major_words": major_words,
+            "pins": list(pins),
+        }
         return res
 
-    # ----------------------------------------------------------------------
-    # STAGE 2: Duplicate or Conflicting PIN Code Detection (11-20, NO API calls)
-    # ----------------------------------------------------------------------
-    if len(pins) > 1:
-        score = score_conflicting_pincodes(pins)
-        subcat = "DOUBLE_PINCODE" if len(pins) == 2 else "MULTIPLE_PINCODES"
+    # Stage 2: Duplicate or Conflicting PIN Code Detection (score 11-20, NO API calls)
+    distinct_pins = sorted(_pincodes(address))
+    if len(distinct_pins) > 1:
+        pin_cat = "DOUBLE_PINCODE" if len(distinct_pins) == 2 else "MULTIPLE_PINCODES"
+        pin_score = 15 if len(distinct_pins) == 2 else 12
         flags = ["DOUBLE_PINCODE", "CONFLICTING_PINCODES"]
         res = _blank_result(
             status="CONFLICTING_PINCODES",
             source_api="VALIDATION_RULE",
-            derivation_type=f"{subcat} ({';'.join(sorted(pins))})",
+            derivation_type=f"{pin_cat} ({', '.join(distinct_pins)})",
             category="DOUBLE_PINCODE",
-            confidence_score=score,
-            recommended_geofence_m=geofence_for_score(score),
+            match_classification=pin_cat,
+            processing_stage="STAGE_2_PINCODE_VALIDATION",
+            confidence_score=pin_score,
+            recommended_geofence_m=geofence_for_score(pin_score),
             flags=flags,
-            verification="PIN_CONFLICT",
-            pins=sorted(pins),
-            major_words=major_words,
-            processing_stage="STAGE_2_CONFLICTING_PINCODES",
-            match_classification=subcat,
+            verification="CONFLICTING_PINCODES",
+            pins=distinct_pins,
+            pincode_list=", ".join(distinct_pins),
+            pincode_count=len(distinct_pins),
+            address_length=len(address),
+            major_word_count=len(major_words),
             address_completeness_status="COMPLETE",
-            address_issue_category="CONFLICTING_PINCODES",
+            address_issue_category=pin_cat,
+            original_address=address,
+            normalized_address=address,
             geocoding_api_called=False,
             places_api_called=False,
         )
         return res
 
-    # ----------------------------------------------------------------------
-    # STAGE 3: Spelling Mistake Detection (21-30, NO API calls)
-    # ----------------------------------------------------------------------
-    has_spelling_err, is_uncertain, suspected, corrections = detect_spelling_errors(address)
-    if has_spelling_err:
-        score = score_spelling_error(suspected, corrections)
-        flags = ["SPELLING_ERROR"]
+    # Stage 3: Offline Spelling Mistake Detection (score 21-30, NO API calls)
+    has_spelling_err, suspected, suggestions, is_uncertain, spell_score = detect_spelling_errors(address)
+    if has_spelling_err or (is_uncertain and SPELLING_UNCERTAIN_POLICY == "STOP"):
+        spell_cat = "SPELLING_ERROR" if has_spelling_err else "SPELLING_UNCERTAIN"
+        flags = [spell_cat]
         res = _blank_result(
-            status="SPELLING_ERROR",
+            status=spell_cat,
             source_api="VALIDATION_RULE",
-            derivation_type=f"SPELLING_ERROR ({';'.join(suspected)} -> {';'.join(corrections)})",
-            category="SPELLING_ERROR",
-            confidence_score=score,
-            recommended_geofence_m=geofence_for_score(score),
+            derivation_type=f"{spell_cat} ({', '.join(suspected)})",
+            category="SPELLING_MISTAKE",
+            match_classification=spell_cat,
+            processing_stage="STAGE_3_SPELLING_VALIDATION",
+            confidence_score=spell_score,
+            recommended_geofence_m=geofence_for_score(spell_score),
             flags=flags,
-            verification="SPELLING_FAILED",
-            pins=sorted(pins),
-            major_words=major_words,
-            processing_stage="STAGE_3_SPELLING_ERROR",
-            match_classification="SPELLING_ERROR",
+            verification=spell_cat,
+            pins=distinct_pins,
+            pincode_list=", ".join(distinct_pins),
+            pincode_count=len(distinct_pins),
+            address_length=len(address),
+            major_word_count=len(major_words),
             address_completeness_status="COMPLETE",
-            address_issue_category="SPELLING_ERROR",
+            address_issue_category=spell_cat,
             spelling_error_detected=True,
-            suspected_misspelled_words=suspected,
-            suggested_spelling_corrections=corrections,
+            suspected_misspelled_words=", ".join(suspected),
+            suggested_spelling_corrections=", ".join(suggestions),
+            original_address=address,
+            normalized_address=address,
             geocoding_api_called=False,
             places_api_called=False,
         )
         return res
 
-    # ----------------------------------------------------------------------
-    # STAGE 4: Synonym and Entity Normalization (60-70 preprocessing, PROCEED)
-    # ----------------------------------------------------------------------
-    norm_address, norm_applied, norm_terms = normalize_synonyms(address)
-    synonym_score = score_synonym_normalization(len(norm_terms.split(";"))) if norm_applied else None
+    # Stage 4: Synonym & Entity Normalization (score 60-70 preprocessing, CONTINUE to API)
+    norm_address, was_normalized, norm_terms = normalize_synonyms(address)
+    synonym_terms_str = ", ".join(norm_terms) if norm_terms else ""
 
-    # Proceed to Geocoding & POI evaluation
-    res = _derive_core(norm_address, client)
+    base_meta = {
+        "original_address": address,
+        "pins": distinct_pins,
+        "pincode_list": ", ".join(distinct_pins),
+        "pincode_count": len(distinct_pins),
+        "address_length": len(address),
+        "major_word_count": len(major_words),
+        "address_completeness_status": "COMPLETE",
+        "address_issue_category": "NONE",
+        "normalized_address": norm_address,
+        "synonym_normalization_applied": was_normalized,
+        "normalized_terms": synonym_terms_str,
+        "spelling_error_detected": is_uncertain,
+        "suspected_misspelled_words": ", ".join(suspected) if is_uncertain else "",
+        "suggested_spelling_corrections": ", ".join(suggestions) if is_uncertain else "",
+        "geocoding_api_called": True,
+        "places_api_called": False,
+    }
 
-    # Preserve Stage 4 normalization details & input diagnostics
-    res["normalized_address"] = norm_address
-    res["synonym_normalization_applied"] = norm_applied
-    res["normalized_terms"] = norm_terms
-    res["synonym_score"] = synonym_score
-    res["pins"] = sorted(pins)
-    res["major_words"] = major_words
-    res["address_completeness_status"] = "COMPLETE"
-    if not res.get("address_issue_category") or res.get("address_issue_category") == "NONE":
-        res["address_issue_category"] = "NONE"
-
-    if is_uncertain:
-        res["flags"].append("SPELLING_UNCERTAIN")
-
-    if norm_applied and "SYNONYM_NORMALIZED" not in res["flags"]:
-        res["flags"].append("SYNONYM_NORMALIZED")
-
-    return res
-
-
-def _derive_core(address: str, client) -> dict:
-    """Geocode, verify, search Places when needed, and return the best candidate with its score."""
-    ctx = AddrCtx(address)
-    g = geocode_lookup(client, address)
+    # Stages 5 & 6: Proceed with Google Geocoding API using normalized address
+    ctx = AddrCtx(norm_address)
+    g = geocode_lookup(client, norm_address)
     ver = verify_geocode(ctx, g)
     g_score, g_cat = geocode_score(g)
     flags: list = []
+    if is_uncertain:
+        flags.append("SPELLING_UNCERTAIN")
 
-    # Fast path: exact rooftop whose own address agrees with the input (Stage 6: Strict Exact Match)
-    if g_cat == "ROOFTOP_EXACT" and not g.get("partial", False) and (
-            ver["status"] in ("MATCH", "NO_DATA") or
-            (ver["status"] == "PIN_MISMATCH" and ver.get("locality_hits", 0) >= 2)):
+    # Fast path: Stage 6 - Strict Exact Match (ROOFTOP + partial_match=False + verified -> 100)
+    if g_cat == "ROOFTOP_EXACT" and not g.get("partial") and (ver["status"] in ("MATCH", "NO_DATA") or
+                                     (ver["status"] == "PIN_MISMATCH" and ver.get("locality_hits", 0) >= 2)):
         if ver["status"] == "PIN_MISMATCH":
             flags.append("PIN_MISMATCH")
-        return _blank_result(
+        res = _blank_result(
             lat=g["lat"], lng=g["lng"], status="EXACT_MATCH", source_api="GEOCODING_API",
             derivation_type="ROOFTOP_EXACT", category="ROOFTOP_EXACT",
-            match_classification="EXACT_MATCH", processing_stage="STAGE_6_EXACT_MATCH",
+            match_classification="EXACT_MATCH",
+            processing_stage="STAGE_6_EXACT_MATCH",
             location_type=g["loc_type"], geocode_location_type=g["loc_type"],
             confidence_score=SCORE_ROOFTOP, recommended_geofence_m=geofence_for_score(SCORE_ROOFTOP),
             formatted_address=g["formatted_address"], verification=ver["status"], flags=flags,
-            geocoding_api_called=True, places_api_called=False)
+            **base_meta)
+        return res
 
     # Places search, biased toward the geocode when it can be believed (Stage 5 fallback)
     lt = g["loc_type"]
     bias = (g["lat"], g["lng"]) if (g["found"] and ver["status"] in ("MATCH", "NO_DATA")) else None
-    p = client.places(address, bias, BIAS_RADIUS_M.get(lt, BIAS_DEFAULT_M) if bias else None)
+    base_meta["places_api_called"] = True
+    p = client.places(norm_address, bias, BIAS_RADIUS_M.get(lt, BIAS_DEFAULT_M) if bias else None)
     results = (p.get("results") or [])[:MAX_PLACES_CANDIDATES]
 
     corroborated = False
@@ -1364,7 +1357,7 @@ def _derive_core(address: str, client) -> dict:
     if hard_fail:
         flags.append("GEOCODE_UNVERIFIED")
         if g_score > SCORE_INCOMPLETE:
-            g_score, g_cat, unverified = SCORE_INCOMPLETE, "INCOMPLETE_ADDRESS", True
+            g_score, g_cat, unverified = SCORE_AREA_LEVEL, "INCOMPLETE_ADDRESS", True
     elif g["found"] and ver["status"] == "PIN_MISMATCH":
         flags.append("PIN_MISMATCH_CORROBORATED")
     trusted = g["found"] and not hard_fail
@@ -1388,7 +1381,7 @@ def _derive_core(address: str, client) -> dict:
                 score += 5
         if trusted and d is not None and cat != "INCOMPLETE_ADDRESS":
             if d > FAR_LIMIT_M.get(lt, FAR_DEFAULT_M):
-                score, cat, ev.reason = SCORE_INCOMPLETE, "INCOMPLETE_ADDRESS", "FAR_FROM_GEOCODE"
+                score, cat, ev.reason = SCORE_AREA_LEVEL, "INCOMPLETE_ADDRESS", "FAR_FROM_GEOCODE"
             elif lt in PRECISE_GEOCODE_TYPES and ver["status"] == "MATCH" \
                     and d > DISAGREE_CAP_M and score > SCORE_PARTIAL:
                 score = SCORE_PARTIAL
@@ -1409,24 +1402,32 @@ def _derive_core(address: str, client) -> dict:
     if g["found"]:
         if best and best["score"] > g_score:
             res = _poi_result(best, g, ver)
+            res.update(base_meta)
+            res["processing_stage"] = "STAGE_5_POI_MATCH" if best["cat"] == "POI_EXACT" else "STAGE_POI_LANDMARK"
+            res["match_classification"] = best["cat"]
         else:
-            stage_name = f"STAGE_5_{g_cat}" if g_cat != "ROOFTOP_EXACT" else "STAGE_6_EXACT_MATCH"
-            match_class = "EXACT_MATCH" if g_cat == "ROOFTOP_EXACT" else g_cat
+            stage = "STAGE_GEOCODING_PARTIAL" if g_cat == "PARTIAL_MATCH" else (
+                    "STAGE_GEOCODING_INTERPOLATED" if g_cat == "INTERPOLATED" else (
+                    "STAGE_GEOCODING_STREET" if g_cat == "STREET_LEVEL" else "STAGE_GEOCODING_AREA"))
+            match_cls = g_cat if g_cat != "INCOMPLETE_ADDRESS" else "AREA_LEVEL"
             res = _blank_result(
                 lat=g["lat"], lng=g["lng"], status=g["status"], source_api="GEOCODING_API_FALLBACK",
                 derivation_type=f"PARTIAL_{lt}" + ("_UNVERIFIED" if unverified else ""),
-                category=g_cat, match_classification=match_class, processing_stage=stage_name,
+                category=g_cat, match_classification=match_cls, processing_stage=stage,
                 location_type=lt, geocode_location_type=lt,
                 distance_m=round(best["d"]) if best and best["d"] is not None else None,
-                confidence_score=g_score, geocoding_api_called=True, places_api_called=bool(results))
-    elif best and (best["score"] > SCORE_INCOMPLETE or best["ev"].usable_area):
+                confidence_score=g_score, **base_meta)
+    elif best and (best["score"] > SCORE_AREA_LEVEL or best["ev"].usable_area):
         res = _poi_result(best, g, ver)               # geocode failed; a trustworthy POI still helps
+        res.update(base_meta)
+        res["processing_stage"] = "STAGE_5_POI_MATCH" if best["cat"] == "POI_EXACT" else "STAGE_POI_LANDMARK"
+        res["match_classification"] = best["cat"]
     else:
         status = g["status"] or (p.get("status") if p else None) or "NOT_FOUND"
-        return _blank_result(status=status, derivation_type="NOT_FOUND", category="NOT_FOUND",
-                             match_classification="NOT_FOUND", processing_stage="UNRESOLVED",
-                             flags=flags, verification=ver["status"], geocoding_api_called=True,
-                             places_api_called=bool(results))
+        res = _blank_result(status=status, derivation_type="NOT_FOUND", category="NOT_FOUND",
+                            match_classification="NOT_FOUND", processing_stage="STAGE_NOT_FOUND",
+                            flags=flags, verification=ver["status"], **base_meta)
+        return res
 
     if best:
         res["place_name"] = (best["place"].get("name") or "").strip() or None
@@ -1443,7 +1444,7 @@ def _derive_core(address: str, client) -> dict:
 
     # Too few place words to pin anything down
     if len(ctx.meaningful) < MIN_MEANINGFUL_WORDS and res["confidence_score"] < 90:
-        res["confidence_score"] = min(res["confidence_score"], 10)
+        res["confidence_score"] = min(res["confidence_score"], SCORE_INCOMPLETE)
         res["category"] = "INCOMPLETE_ADDRESS"
         res["flags"].append("TOO_FEW_WORDS")
 
@@ -1457,19 +1458,12 @@ def _poi_result(best: dict, g: dict, ver: dict) -> dict:
     name = (place.get("name") or "").strip()
     kind = {"LANDMARK_EXACT": "LANDMARK_PLACE_MATCH", "INCOMPLETE_ADDRESS": "AREA_PLACE_MATCH"}.get(
         best["cat"], "POI_PLACE_MATCH")
-    classification = "POI_EXACT" if best["cat"] == "POI_EXACT" else (
-        "LANDMARK_MATCH" if best["cat"] == "LANDMARK_EXACT" else best["cat"]
-    )
-    stage = "STAGE_5_POI_MATCH" if best["cat"] == "POI_EXACT" else (
-        "STAGE_5_LANDMARK_MATCH" if best["cat"] == "LANDMARK_EXACT" else "STAGE_5_OTHER"
-    )
     return _blank_result(
         lat=loc["lat"], lng=loc["lng"], status="OK (PLACES_API_MATCH)", source_api="PLACES_API",
         derivation_type=f"{kind} ({name})" if name else kind, category=best["cat"],
-        match_classification=classification, processing_stage=stage,
         match_ratio=ev.ratio, location_type="POI", geocode_location_type=g["loc_type"],
         distance_m=round(best["d"]) if best["d"] is not None else None,
-        confidence_score=best["score"], geocoding_api_called=True, places_api_called=True)
+        confidence_score=best["score"])
 
 
 # --------------------------------------------------------------------------
@@ -1598,23 +1592,28 @@ def build_remarks(res: dict, flags) -> str:
     fa = res.get("formatted_address") or ""
     parts = []
 
-    if cat == "DOUBLE_PINCODE" or "DOUBLE_PINCODE" in flags:
+    if "DOUBLE_PINCODE" in flags or "MULTIPLE_PINCODES" in flags:
         pins = " and ".join(res.get("pins") or [])
-        parts.append(f"Multiple conflicting PIN codes ({pins}) detected; geocoding skipped to avoid ambiguous location.")
-    elif cat == "SPELLING_ERROR" or "SPELLING_ERROR" in flags:
-        susp = ", ".join(res.get("suspected_misspelled_words") or [])
-        corr = ", ".join(res.get("suggested_spelling_corrections") or [])
-        parts.append(f"Spelling error detected in address words: {susp} (suggested: {corr}); geocoding skipped.")
-    elif cat == "ROOFTOP_EXACT" or cat == "EXACT_MATCH":
+        text = f"Multiple distinct pincodes ({pins}) in the address; address left unchanged, not geocoded to avoid inaccurate match."
+        if under:
+            text += f" Underlying result before this rule: {score} {cat}."
+        parts.append(text)
+    elif "SPELLING_ERROR" in flags or cat == "SPELLING_ERROR":
+        suspected = res.get("suspected_misspelled_words") or ""
+        suggestions = res.get("suggested_spelling_corrections") or ""
+        parts.append(f"Suspected spelling mistake in address: '{suspected}' (suggested: '{suggestions}'); validation stopped without API calls.")
+    elif "SPELLING_UNCERTAIN" in flags or cat == "SPELLING_UNCERTAIN":
+        suspected = res.get("suspected_misspelled_words") or ""
+        parts.append(f"Uncertain spelling detected for '{suspected}'; flagged for manual review.")
+
+    near = f" ({d} m from the geocode)" if d is not None else ""
+    if cat == "ROOFTOP_EXACT":
         parts.append("Exact rooftop match; Google's address agrees with the input.")
     elif cat == "POI_EXACT":
-        near = f" ({d} m from the geocode)" if d is not None else ""
         parts.append(f"Named place '{place}' appears in the address{near}.")
-    elif cat == "LANDMARK_EXACT" or cat == "LANDMARK_MATCH":
-        near = f" ({d} m from the geocode)" if d is not None else ""
+    elif cat == "LANDMARK_EXACT":
         parts.append(f"Address is near the landmark '{place}'{near}; coordinates are the landmark's, not the house.")
     elif cat == "SPELLING_MISTAKE":
-        near = f" ({d} m from the geocode)" if d is not None else ""
         parts.append(f"Spelling mistake: {_pairs(res.get('typos') or [], 'address', 'place name')}; "
                      f"matched place '{place}'{near}.")
     elif cat == "PARTIAL_MATCH":
@@ -1631,9 +1630,9 @@ def build_remarks(res: dict, flags) -> str:
             words_list = details.get("major_words") or []
             words_str = f" ({', '.join(words_list)})" if words_list else ""
             chars_cnt = details.get("length", 0)
-            if subcat in ("MISSING_PINCODE", "PINCODE_MISSING"):
+            if subcat == "MISSING_PINCODE":
                 parts.append("Incomplete address: missing 6-digit Indian postal pincode.")
-            elif subcat in ("TOO_FEW_WORDS", "INSUFFICIENT_MAJOR_WORDS"):
+            elif subcat == "TOO_FEW_WORDS":
                 parts.append(f"Incomplete address: only {cnt} major word(s){words_str}; requires more than 3 major words.")
             elif subcat == "ADDRESS_TOO_SHORT":
                 parts.append(f"Incomplete address: address length ({chars_cnt} characters) is below the minimum threshold (15 characters).")
@@ -1664,9 +1663,6 @@ def build_remarks(res: dict, flags) -> str:
     else:
         parts.append(f"Scored {score} ({cat}).")
 
-    if res.get("synonym_normalization_applied"):
-        terms = res.get("normalized_terms", "")
-        parts.append(f"Normalized synonyms: {terms}.")
     if res.get("typos") and cat != "SPELLING_MISTAKE":
         parts.append(f"Possible spelling difference with '{place}': {_pairs(res['typos'], 'address', 'place name')}.")
     if res.get("variants"):
@@ -1679,6 +1675,9 @@ def build_remarks(res: dict, flags) -> str:
         parts.append("The matched place is more than 2 km from the geocode; score capped.")
     if "ADDRESS_TRUNCATED" in flags:
         parts.append("Address was very long and was shortened before geocoding.")
+    if res.get("synonym_normalization_applied"):
+        terms = res.get("normalized_terms") or ""
+        parts.append(f"Synonym normalization applied ({terms}) before geocoding.")
     return " ".join(parts)
 
 
@@ -1689,20 +1688,17 @@ def build_row(idx, loan_no, address_col, original, sanitized, res, extra_flags):
 
     orig_str = re.sub(r"\s+", " ", str(original)).strip() if original is not None else ""
     san_str = sanitized or ""
-    norm_str = res.get("normalized_address") or san_str
+    norm_str = res.get("normalized_address") or san_str or orig_str
 
     pins = res.get("pins") or []
-    if not pins and san_str:
-        pins = sorted(_pincodes(san_str))
-    major_words = res.get("major_words") or []
-    if not major_words and san_str:
-        major_words = get_major_words(san_str)
+    pin_str = res.get("pincode_list") or (", ".join(pins) if isinstance(pins, (list, set)) else str(pins))
+    pin_cnt = res.get("pincode_count") if res.get("pincode_count") is not None else len(pins)
 
-    suspected = res.get("suspected_misspelled_words") or []
-    corrections = res.get("suggested_spelling_corrections") or []
+    addr_len = res.get("address_length") or len(san_str or orig_str)
+    major_cnt = res.get("major_word_count", 0)
 
-    match_class = res.get("match_classification") or res.get("category") or res.get("derivation_type")
-    score_cat = res.get("category") or res.get("score_category") or res.get("derivation_type")
+    match_cls = res.get("match_classification") or res.get("category") or ""
+    score_cat = res.get("category") or res.get("derivation_type") or match_cls
 
     return {
         "input_row": idx,
@@ -1711,23 +1707,23 @@ def build_row(idx, loan_no, address_col, original, sanitized, res, extra_flags):
         "original_address": orig_str,
         "sanitized_address": san_str,
         "normalized_address": norm_str,
-        "address_length": len(san_str),
-        "major_word_count": len(major_words),
-        "pincode_list": ";".join(pins),
-        "pincode_count": len(pins),
-        "address_completeness_status": res.get("address_completeness_status", "COMPLETE"),
-        "address_issue_category": res.get("address_issue_category", "NONE"),
-        "spelling_error_detected": bool(res.get("spelling_error_detected", False)),
-        "suspected_misspelled_words": ";".join(suspected) if isinstance(suspected, list) else str(suspected),
-        "suggested_spelling_corrections": ";".join(corrections) if isinstance(corrections, list) else str(corrections),
-        "synonym_normalization_applied": bool(res.get("synonym_normalization_applied", False)),
-        "normalized_terms": res.get("normalized_terms", "") or "",
-        "processing_stage": res.get("processing_stage", ""),
+        "address_length": addr_len,
+        "major_word_count": major_cnt,
+        "pincode_list": pin_str,
+        "pincode_count": pin_cnt,
+        "address_completeness_status": res.get("address_completeness_status") or "COMPLETE",
+        "address_issue_category": res.get("address_issue_category") or "NONE",
+        "spelling_error_detected": bool(res.get("spelling_error_detected")),
+        "suspected_misspelled_words": res.get("suspected_misspelled_words") or "",
+        "suggested_spelling_corrections": res.get("suggested_spelling_corrections") or "",
+        "synonym_normalization_applied": bool(res.get("synonym_normalization_applied")),
+        "normalized_terms": res.get("normalized_terms") or "",
+        "processing_stage": res.get("processing_stage") or "",
         "confidence_score": res.get("confidence_score"),
-        "match_classification": match_class,
+        "match_classification": match_cls,
         "score_category": score_cat,
-        "geocoding_api_called": bool(res.get("geocoding_api_called", False)),
-        "places_api_called": bool(res.get("places_api_called", False)),
+        "geocoding_api_called": bool(res.get("geocoding_api_called")),
+        "places_api_called": bool(res.get("places_api_called")),
         "latitude": lat,
         "longitude": lng,
         "geocode_status": res.get("status"),
@@ -1896,31 +1892,12 @@ def ensure_db_tables(conn, schema: str, input_table: str, output_table: str, cac
         processed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT uq_{output_table}_loan_col UNIQUE (soa_loan_no, address_column)
     );
-
-    -- Auto-migrate existing table if columns are missing
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS normalized_address TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS address_length INTEGER;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS major_word_count INTEGER;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS pincode_list TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS pincode_count INTEGER;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS address_completeness_status TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS address_issue_category TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS spelling_error_detected BOOLEAN;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS suspected_misspelled_words TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS suggested_spelling_corrections TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS synonym_normalization_applied BOOLEAN;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS normalized_terms TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS processing_stage TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS match_classification TEXT;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS geocoding_api_called BOOLEAN;
-    ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS places_api_called BOOLEAN;
-
     CREATE INDEX IF NOT EXISTS idx_{output_table}_loan_no ON {schema}.{output_table}(soa_loan_no);
     CREATE INDEX IF NOT EXISTS idx_{output_table}_score_cat ON {schema}.{output_table}(score_category);
-    CREATE INDEX IF NOT EXISTS idx_{output_table}_match_class ON {schema}.{output_table}(match_classification);
-    CREATE INDEX IF NOT EXISTS idx_{output_table}_stage ON {schema}.{output_table}(processing_stage);
     CREATE INDEX IF NOT EXISTS idx_{output_table}_review ON {schema}.{output_table}(review_needed);
     CREATE INDEX IF NOT EXISTS idx_{output_table}_derivation ON {schema}.{output_table}(derivation_type);
+    CREATE INDEX IF NOT EXISTS idx_{output_table}_stage ON {schema}.{output_table}(processing_stage);
+    CREATE INDEX IF NOT EXISTS idx_{output_table}_match_cls ON {schema}.{output_table}(match_classification);
 
     CREATE TABLE IF NOT EXISTS {schema}.{cache_table} (
         key TEXT PRIMARY KEY,
@@ -1929,6 +1906,32 @@ def ensure_db_tables(conn, schema: str, input_table: str, output_table: str, cac
     );
     CREATE INDEX IF NOT EXISTS idx_{cache_table}_saved_at ON {schema}.{cache_table}(saved_at);
     """)
+
+    # Migrate existing table columns if already created in earlier runs
+    migration_columns = [
+        ("normalized_address", "TEXT"),
+        ("address_length", "INTEGER"),
+        ("major_word_count", "INTEGER"),
+        ("pincode_list", "TEXT"),
+        ("pincode_count", "INTEGER"),
+        ("address_completeness_status", "TEXT"),
+        ("address_issue_category", "TEXT"),
+        ("spelling_error_detected", "BOOLEAN"),
+        ("suspected_misspelled_words", "TEXT"),
+        ("suggested_spelling_corrections", "TEXT"),
+        ("synonym_normalization_applied", "BOOLEAN"),
+        ("normalized_terms", "TEXT"),
+        ("processing_stage", "TEXT"),
+        ("match_classification", "TEXT"),
+        ("geocoding_api_called", "BOOLEAN"),
+        ("places_api_called", "BOOLEAN"),
+    ]
+    for col_name, col_type in migration_columns:
+        try:
+            cur.execute(f"ALTER TABLE {schema}.{output_table} ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
+        except Exception:
+            conn.rollback()
+
     conn.commit()
     cur.close()
 
@@ -1941,13 +1944,16 @@ def save_db_batch(conn, schema: str, output_table: str, batch: list):
     cur = conn.cursor()
     cols = [
         "input_row", "soa_loan_no", "address_column", "original_address", "sanitized_address",
-        "normalized_address", "address_length", "major_word_count", "pincode_list", "pincode_count",
-        "address_completeness_status", "address_issue_category", "spelling_error_detected",
-        "suspected_misspelled_words", "suggested_spelling_corrections", "synonym_normalization_applied",
-        "normalized_terms", "processing_stage", "confidence_score", "match_classification",
-        "score_category", "geocoding_api_called", "places_api_called", "latitude", "longitude",
-        "geocode_status", "source_api", "derivation_type", "location_type", "geocode_location_type",
-        "distance_between_apis_m", "name_match_ratio", "place_name", "place_types",
+        "normalized_address",
+        "address_length", "major_word_count", "pincode_list", "pincode_count",
+        "address_completeness_status", "address_issue_category",
+        "spelling_error_detected", "suspected_misspelled_words", "suggested_spelling_corrections",
+        "synonym_normalization_applied", "normalized_terms",
+        "processing_stage", "confidence_score", "match_classification", "score_category",
+        "geocoding_api_called", "places_api_called",
+        "latitude", "longitude", "geocode_status", "source_api", "derivation_type",
+        "location_type", "geocode_location_type", "distance_between_apis_m",
+        "name_match_ratio", "place_name", "place_types",
         "recommended_geofence_radius_m", "geocode_formatted_address", "address_verification",
         "flags", "review_needed", "remarks", "script_version"
     ]
@@ -1960,23 +1966,23 @@ def save_db_batch(conn, schema: str, output_table: str, batch: list):
             r.get("original_address") or "",
             r.get("sanitized_address") or "",
             r.get("normalized_address") or "",
-            r.get("address_length"),
-            r.get("major_word_count"),
+            r.get("address_length") or 0,
+            r.get("major_word_count") or 0,
             r.get("pincode_list") or "",
-            r.get("pincode_count"),
-            r.get("address_completeness_status") or "",
-            r.get("address_issue_category") or "",
-            bool(r.get("spelling_error_detected", False)),
+            r.get("pincode_count") or 0,
+            r.get("address_completeness_status") or "COMPLETE",
+            r.get("address_issue_category") or "NONE",
+            bool(r.get("spelling_error_detected")),
             r.get("suspected_misspelled_words") or "",
             r.get("suggested_spelling_corrections") or "",
-            bool(r.get("synonym_normalization_applied", False)),
+            bool(r.get("synonym_normalization_applied")),
             r.get("normalized_terms") or "",
             r.get("processing_stage") or "",
             r.get("confidence_score"),
             r.get("match_classification") or "",
-            r.get("score_category") or "",
-            bool(r.get("geocoding_api_called", False)),
-            bool(r.get("places_api_called", False)),
+            r.get("score_category"),
+            bool(r.get("geocoding_api_called")),
+            bool(r.get("places_api_called")),
             r.get("latitude"),
             r.get("longitude"),
             r.get("geocode_status"),
@@ -2010,49 +2016,6 @@ def save_db_batch(conn, schema: str, output_table: str, batch: list):
     extras.execute_values(cur, insert_sql, records, page_size=len(records))
     conn.commit()
     cur.close()
-
-
-def print_pipeline_summary(stats: dict, stage_counts: Counter, total_rows: int, saved_rows: int, review_rows: int, output_dest: str = ""):
-    """Print cost tracking and pipeline stage execution metrics."""
-    print("\n" + "=" * 76)
-    print("      COST-OPTIMIZED ADDRESS VALIDATION & GEOCODING SUMMARY")
-    print("=" * 76)
-    if output_dest:
-        print(f"Destination:                          {output_dest}")
-    print(f"Total rows evaluated:                 {total_rows}")
-    print(f"Rows successfully saved:              {saved_rows}")
-    print(f"Rows flagged for review:              {review_rows}")
-    print("-" * 76)
-    print("PIPELINE STAGE CLASSIFICATION BREAKDOWN:")
-    print(f"  Stage 1: Incomplete Address (0-9):     {stage_counts.get('stage1_incomplete', 0):>6}  [API Calls: 0]")
-    print(f"  Stage 2: Conflicting PINs (11-20):     {stage_counts.get('stage2_conflicting_pins', 0):>6}  [API Calls: 0]")
-    print(f"  Stage 3: Spelling Mistakes (21-30):    {stage_counts.get('stage3_spelling_errors', 0):>6}  [API Calls: 0]")
-    print(f"  Stage 4: Synonym Normalizations:       {stage_counts.get('stage4_synonyms', 0):>6}  [Proceeded to API]")
-    print(f"  Stage 5: Verified POI Matches (90-99): {stage_counts.get('stage5_poi', 0):>6}")
-    print(f"  Stage 6: Strict Exact Matches (100):   {stage_counts.get('stage6_exact', 0):>6}")
-    print(f"  Other Matches (Partial/Street):        {stage_counts.get('other_matches', 0):>6}")
-    print(f"  Unresolved / API / Input Errors:       {stage_counts.get('unresolved_or_error', 0):>6}")
-    print("-" * 76)
-    geo_calls = stats.get("geocode_calls", stats.get("api_calls", 0))
-    pla_calls = stats.get("places_calls", 0)
-    cache_hits = stats.get("cache_hits", 0)
-    cost_incurred = geo_calls * COST_GEOCODING_PER_REQ + pla_calls * COST_PLACES_PER_REQ
-    early_rejections = (stage_counts.get('stage1_incomplete', 0) +
-                        stage_counts.get('stage2_conflicting_pins', 0) +
-                        stage_counts.get('stage3_spelling_errors', 0))
-    cost_saved_rejections = early_rejections * (COST_GEOCODING_PER_REQ + 0.5 * COST_PLACES_PER_REQ)
-    cost_saved_cache = cache_hits * COST_GEOCODING_PER_REQ
-    total_saved = cost_saved_rejections + cost_saved_cache
-
-    print("API CALLS & ESTIMATED COST IMPACT:")
-    print(f"  Geocoding API calls made:              {geo_calls:>6}  (@ ${COST_GEOCODING_PER_REQ:.3f} = ${geo_calls * COST_GEOCODING_PER_REQ:.4f})")
-    print(f"  Places API calls made:                 {pla_calls:>6}  (@ ${COST_PLACES_PER_REQ:.3f} = ${pla_calls * COST_PLACES_PER_REQ:.4f})")
-    print(f"  Total API Calls:                       {geo_calls + pla_calls:>6}")
-    print(f"  Cache hits (disk / DB):                {cache_hits:>6}  (Saved ~${cost_saved_cache:.4f})")
-    print(f"  Early rejections (Stages 1-3):         {early_rejections:>6}  (Saved ~${cost_saved_rejections:.4f})")
-    print(f"  Total Estimated Cost Incurred:         ${cost_incurred:.4f} USD")
-    print(f"  Total Estimated Cost Saved:            ${total_saved:.4f} USD")
-    print("=" * 76 + "\n")
 
 
 def _run_db(args, api_key, client_factory) -> int:
@@ -2112,14 +2075,9 @@ def _run_db(args, api_key, client_factory) -> int:
     rows = cur.fetchall()
     total_pending = len(rows)
 
-    if getattr(args, "random", False):
-        if getattr(args, "seed", None) is not None:
-            random.seed(args.seed)
-        random.shuffle(rows)
-
     if args.limit is not None:
         rows = rows[:max(0, args.limit)]
-        print(f"Found {total_pending} pending rows; processing up to {len(rows)} (limit = {args.limit}, random = {bool(args.random)})")
+        print(f"Found {total_pending} pending rows; processing up to {len(rows)} (limit = {args.limit})")
     else:
         print(f"Rows to process from {db_schema}.{input_table}: {len(rows)}")
 
@@ -2159,7 +2117,6 @@ def _run_db(args, api_key, client_factory) -> int:
     saved_total = skipped_api = skipped_cache = 0
     consecutive_api = consecutive_internal = 0
     categories = Counter()
-    stage_counts = Counter()
     review = 0
     exit_code = 0
 
@@ -2221,26 +2178,6 @@ def _run_db(args, api_key, client_factory) -> int:
             row = build_row(row_id, loan_no, address_col, original, sanitized, res, san_flags)
             categories[row["score_category"]] += 1
             review += 1 if row["review_needed"] else 0
-
-            p_stage = row.get("processing_stage", "")
-            if p_stage == "STAGE_1_INCOMPLETE":
-                stage_counts["stage1_incomplete"] += 1
-            elif p_stage == "STAGE_2_CONFLICTING_PINCODES":
-                stage_counts["stage2_conflicting_pins"] += 1
-            elif p_stage == "STAGE_3_SPELLING_ERROR":
-                stage_counts["stage3_spelling_errors"] += 1
-            elif p_stage == "STAGE_5_POI_EXACT":
-                stage_counts["stage5_poi"] += 1
-            elif p_stage == "STAGE_6_STRICT_EXACT":
-                stage_counts["stage6_exact"] += 1
-            elif p_stage in ("PARTIAL_MATCH", "INTERPOLATED_MATCH", "STREET_LEVEL_MATCH"):
-                stage_counts["other_matches"] += 1
-            else:
-                stage_counts["unresolved_or_error"] += 1
-
-            if row.get("synonym_normalization_applied"):
-                stage_counts["stage4_synonyms"] += 1
-
             batch.append(row)
             if len(batch) >= args.batch_size:
                 flush_db()
@@ -2259,13 +2196,15 @@ def _run_db(args, api_key, client_factory) -> int:
         if cache is not None:
             cache.close()
 
-    print_pipeline_summary(stats, stage_counts, len(rows), saved_total, review, output_dest=f"PostgreSQL ({db_schema}.{output_table})")
+    print(f"\nDone. {saved_total} rows written to PostgreSQL -> {db_schema}.{output_table}")
     if categories:
-        print("Score Categories: " + ", ".join(f"{k}={v}" for k, v in sorted(categories.items())))
+        print("Categories: " + ", ".join(f"{k}={v}" for k, v in sorted(categories.items())))
+    print(f"Rows flagged for review: {review}")
     if skipped_api:
         print(f"Not saved because of API/network errors (will be retried next run): {skipped_api}")
     if skipped_cache:
         print(f"Skipped because they are not in the cache (--cache-only): {skipped_cache}")
+    print(f"API calls made: {stats.get('api_calls', 0)} | served from disk cache: {stats.get('cache_hits', 0)}")
     return exit_code
 
 
@@ -2279,10 +2218,6 @@ def parse_arguments(argv=None):
     p.add_argument("--address-col", "-a", default=None, help="Address column (auto-detects soa_current_address / Addresses / address)")
     p.add_argument("--loan-col", "-l", default="soa_loan_no", help="Loan number column (default: soa_loan_no)")
     p.add_argument("--limit", "-n", type=int, default=None, help="Process at most N NEW rows this run")
-    p.add_argument("--random", "--shuffle", action="store_true",
-                   help="Pick rows in random order instead of sequentially (great with --limit)")
-    p.add_argument("--seed", type=int, default=None,
-                   help="Random seed for reproducible selection (optional)")
     p.add_argument("--batch-size", "-b", type=int, default=20, help="Rows per save to CSV / PostgreSQL (default: 20)")
     p.add_argument("--region", default="in", help="Region bias for Google (default: in)")
     p.add_argument("--cache-db", default=DEFAULT_CACHE_DB, help=f"SQLite cache file (default: {DEFAULT_CACHE_DB})")
@@ -2426,13 +2361,9 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
         write_header(output_csv)
 
     todo = [i for i in range(total_records) if i not in processed_rows]
-    if getattr(args, "random", False):
-        if getattr(args, "seed", None) is not None:
-            random.seed(args.seed)
-        random.shuffle(todo)
     if args.limit is not None:
         todo = todo[:max(0, args.limit)]
-        print(f"Processing up to {len(todo)} new rows (limit = {args.limit}, random = {bool(args.random)})")
+        print(f"Processing up to {len(todo)} new rows (limit = {args.limit})")
     print(f"Rows to process: {len(todo)}")
 
     # ---- client ------------------------------------------------------------
@@ -2459,7 +2390,6 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
     saved_total = skipped_api = skipped_cache = 0
     consecutive_api = consecutive_internal = 0
     categories: Counter = Counter()
-    stage_counts: Counter = Counter()
     review = 0
     exit_code = 0
 
@@ -2523,26 +2453,6 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
             row = build_row(idx, loan_no, address_col, original, sanitized, res, san_flags)
             categories[row["score_category"]] += 1
             review += 1 if row["review_needed"] else 0
-
-            p_stage = row.get("processing_stage", "")
-            if p_stage == "STAGE_1_INCOMPLETE":
-                stage_counts["stage1_incomplete"] += 1
-            elif p_stage == "STAGE_2_CONFLICTING_PINCODES":
-                stage_counts["stage2_conflicting_pins"] += 1
-            elif p_stage == "STAGE_3_SPELLING_ERROR":
-                stage_counts["stage3_spelling_errors"] += 1
-            elif p_stage == "STAGE_5_POI_EXACT":
-                stage_counts["stage5_poi"] += 1
-            elif p_stage == "STAGE_6_STRICT_EXACT":
-                stage_counts["stage6_exact"] += 1
-            elif p_stage in ("PARTIAL_MATCH", "INTERPOLATED_MATCH", "STREET_LEVEL_MATCH"):
-                stage_counts["other_matches"] += 1
-            else:
-                stage_counts["unresolved_or_error"] += 1
-
-            if row.get("synonym_normalization_applied"):
-                stage_counts["stage4_synonyms"] += 1
-
             batch.append(row)
             if len(batch) >= args.batch_size:
                 flush()
@@ -2559,13 +2469,15 @@ def _run(args, df, addresses, loans, address_col, loan_col, api_key, client_fact
         if cache is not None:
             cache.close()
 
-    print_pipeline_summary(stats, stage_counts, len(todo), saved_total, review, output_dest=output_csv)
+    print(f"\nDone. {saved_total} rows written this run -> {output_csv}")
     if categories:
-        print("Score Categories: " + ", ".join(f"{k}={v}" for k, v in sorted(categories.items())))
+        print("Categories: " + ", ".join(f"{k}={v}" for k, v in sorted(categories.items())))
+    print(f"Rows flagged for review: {review}")
     if skipped_api:
         print(f"Not saved because of API/network errors (will be retried next run): {skipped_api}")
     if skipped_cache:
         print(f"Skipped because they are not in the cache (--cache-only): {skipped_cache}")
+    print(f"API calls made: {stats.get('api_calls', 0)} | served from disk cache: {stats.get('cache_hits', 0)}")
     return exit_code
 
 
