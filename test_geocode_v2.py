@@ -157,13 +157,13 @@ def test_poi_224km_away_is_rejected():                          # row 7
     r, _ = run("16 B NARAYAN NAGAR SOC K ROAD NEAR HOTEL 7 STRA VAVOL - 382420",
                geo(23.2252, 72.6225, "APPROXIMATE", "Vavol, Gujarat 382420, India", types=["locality"]),
                places(place("Hotel 7 star", "K Road, Vavol, Gujarat", ["lodging", "establishment"], 21.17, 72.83)))
-    assert r["confidence_score"] <= 10 and r["source_api"] != "PLACES_API"
+    assert r["confidence_score"] == 31 and r["source_api"] != "PLACES_API"
 
 
 def test_partial_rooftop_wrong_pincode_downgraded():           # rows 0/11/15 style
     r, _ = run("NO 268 RAMAKKA LAYOUT ANEKAL BANGALORE - 562106",
                geo(12.85, 77.58, "ROOFTOP", "Gottigere, Bengaluru, Karnataka 560083, India", partial=True))
-    assert r["confidence_score"] == 10 and r["derivation_type"].endswith("_UNVERIFIED")
+    assert r["confidence_score"] == 31 and r["derivation_type"].endswith("_UNVERIFIED")
     assert "GEOCODE_UNVERIFIED" in r["flags"]
     row = v2.build_row(0, "L1", "addr", "orig", "san", r, [])
     assert row["review_needed"] is True
@@ -218,7 +218,7 @@ def test_junction_named_after_area_is_not_a_landmark():         # row 36
                geo(27.19, 78.02, "APPROXIMATE", "Belanganj, Agra, Uttar Pradesh 282004, India", types=["sublocality"],
                    comps=[comp("Belanganj", "sublocality_level_1"), comp("Agra", "locality"), comp("282004", "postal_code")]),
                places(place("Belanganj chauraha", "Belanganj, Agra, Uttar Pradesh 282004", ["establishment", "store"], 27.25, 78.03)))
-    assert r["confidence_score"] <= 10
+    assert r["confidence_score"] == 31
 
 
 def test_area_named_place_with_locality_geocode_rejected():      # "Lodha", "Semari", "Tehsil Kol" cases
@@ -226,7 +226,7 @@ def test_area_named_place_with_locality_geocode_rejected():      # "Lodha", "Sem
                geo(27.11, 78.02, "GEOMETRIC_CENTER", "Semari, Agra, Uttar Pradesh 282001, India", types=["sublocality"],
                    comps=[comp("Semari", "sublocality_level_1"), comp("Agra", "locality")]),
                places(place("Semari", "Semari, Agra, Uttar Pradesh", ["establishment", "health"], 27.11, 78.02)))
-    assert r["confidence_score"] <= 10
+    assert r["confidence_score"] == 31
 
 
 @pytest.mark.parametrize("name,types", [("Patibandla", ["locality", "political"]),
@@ -940,11 +940,11 @@ def test_complete_address_with_area_level_geocode_scores_area_level():
     row = v2.build_row(1, "LOAN001", "addr", addr, addr, res, [])
 
     assert row["address_completeness_status"] == "COMPLETE"
-    assert row["confidence_score"] == 10
-    assert row["score_category"] == "INCOMPLETE_ADDRESS"
-    assert row["match_classification"] == "INCOMPLETE_ADDRESS"
-    assert row["processing_stage"] == "STAGE_GEOCODING_INCOMPLETE"
-    assert "Incomplete address match" in row["remarks"]
+    assert row["confidence_score"] == 31
+    assert row["score_category"] == "LOW_CONFIDENCE"
+    assert row["match_classification"] == "LOW_CONFIDENCE"
+    assert row["address_issue_category"] == "AREA_ONLY_MATCH"
+    assert "Area-level match" in row["remarks"]
 
 # --------------------------------------------------------------------------
 # Multiprocessing and Concurrency Tests

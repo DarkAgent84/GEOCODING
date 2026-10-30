@@ -93,7 +93,7 @@ Address Input
 | **35** | `STREET_LEVEL` | Post-API Route / Street | Yes | Attempted | **1000 m** |
 | **21–30** | `SPELLING_ERROR` | Stage 3: Spelling Error | **No** | **No** | **1000 m** |
 | **11–20** | `DOUBLE_PINCODE` | Stage 2: Conflicting PINs | **No** | **No** | **1000 m** |
-| **10** | `INCOMPLETE_ADDRESS` | Post-API Locality Centroid | Yes | Attempted | **1000 m** |
+| **31** | `LOW_CONFIDENCE` | Complete Address (Area / Locality Centroid Only) | Yes | Attempted | **1000 m** |
 | **0–9** | `INCOMPLETE_ADDRESS` | Stage 1: Incomplete Address | **No** | **No** | **1000 m** |
 | **0** | `NOT_FOUND` / `INVALID` | Unresolved or Empty Input | Attempted | Attempted | *None* |
 
