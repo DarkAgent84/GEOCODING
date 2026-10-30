@@ -29,7 +29,7 @@ Score bands (the geofence radius follows the score)
   35       STREET_LEVEL       only the street was located                             -> 1000 m
   21-30    SPELLING_MISTAKE   place name matched only through a misspelling           -> 1000 m
   11-20    DOUBLE_PINCODE     address holds two or more different pincodes            -> 1000 m
-  10       AREA_LEVEL         area / locality level only, or no candidate trusted     -> 1000 m
+  10       INCOMPLETE_ADDRESS area / locality level only, or no candidate trusted     -> 1000 m
   0-9      INCOMPLETE_ADDRESS fails one or more of the 3 constraints (see above)      -> 1000 m (none at 0)
   0        NOT_FOUND / INVALID_INPUT                                                  -> none
 Every row also gets a plain-language `remarks` column.
@@ -1067,7 +1067,7 @@ def geocode_score(g: dict):
     if "route" in types and not (types & {"street_address", "premise", "subpremise",
                                           "establishment", "point_of_interest"}):
         return SCORE_STREET, "STREET_LEVEL"
-    return SCORE_AREA_LEVEL, "AREA_LEVEL"        # locality centre / area-level / unknown
+    return SCORE_INCOMPLETE, "INCOMPLETE_ADDRESS"  # locality centre / area-level coarse fallback
 
 
 def verify_geocode(ctx: AddrCtx, g: dict) -> dict:
@@ -1475,8 +1475,8 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
     unverified = False
     if hard_fail:
         flags.append("GEOCODE_UNVERIFIED")
-        if g_score > SCORE_AREA_LEVEL:
-            g_score, g_cat, unverified = SCORE_AREA_LEVEL, "AREA_LEVEL", True
+        if g_score > SCORE_INCOMPLETE:
+            g_score, g_cat, unverified = SCORE_INCOMPLETE, "INCOMPLETE_ADDRESS", True
     elif g["found"] and ver["status"] == "PIN_MISMATCH":
         flags.append("PIN_MISMATCH_CORROBORATED")
     trusted = g["found"] and not hard_fail
@@ -1498,9 +1498,9 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
             if (cat == "POI_EXACT" and not set(_expand(r.get("name", "")).split()) <= (COMMON_DEITY_WORDS | POI_GENERIC_WORDS)
                     and sum(1 for x in results if _normalize(x.get("name", "")) == name_norm) == 1):
                 score += 5
-        if trusted and d is not None and cat != "AREA_LEVEL":
+        if trusted and d is not None and cat != "INCOMPLETE_ADDRESS":
             if d > FAR_LIMIT_M.get(lt, FAR_DEFAULT_M):
-                score, cat, ev.reason = SCORE_AREA_LEVEL, "AREA_LEVEL", "FAR_FROM_GEOCODE"
+                score, cat, ev.reason = SCORE_INCOMPLETE, "INCOMPLETE_ADDRESS", "FAR_FROM_GEOCODE"
             elif lt in PRECISE_GEOCODE_TYPES and ver["status"] == "MATCH" \
                     and d > DISAGREE_CAP_M and score > SCORE_PARTIAL:
                 score = SCORE_PARTIAL
@@ -1527,7 +1527,7 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
         else:
             stage = "STAGE_GEOCODING_PARTIAL" if g_cat == "PARTIAL_MATCH" else (
                     "STAGE_GEOCODING_INTERPOLATED" if g_cat == "INTERPOLATED" else (
-                    "STAGE_GEOCODING_STREET" if g_cat == "STREET_LEVEL" else "STAGE_GEOCODING_AREA"))
+                    "STAGE_GEOCODING_STREET" if g_cat == "STREET_LEVEL" else "STAGE_GEOCODING_INCOMPLETE"))
             match_cls = g_cat
             res = _blank_result(
                 lat=g["lat"], lng=g["lng"], status=g["status"], source_api="GEOCODING_API_FALLBACK",
@@ -1536,7 +1536,7 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
                 location_type=lt, geocode_location_type=lt,
                 distance_m=round(best["d"]) if best and best["d"] is not None else None,
                 confidence_score=g_score, **base_meta)
-    elif best and (best["score"] > SCORE_AREA_LEVEL or best["ev"].usable_area):
+    elif best and (best["score"] > SCORE_INCOMPLETE or best["ev"].usable_area):
         res = _poi_result(best, g, ver)               # geocode failed; a trustworthy POI still helps
         res.update(base_meta)
         res["processing_stage"] = "STAGE_5_POI_MATCH" if best["cat"] == "POI_EXACT" else "STAGE_POI_LANDMARK"
@@ -1554,7 +1554,7 @@ def _derive_core(address: str, client=None, no_api: bool = False) -> dict:
         flags.extend(f for f in best["flags"] if f not in flags)
         if best["cat"] == "SPELLING_MISTAKE":
             res["typos"] = best["ev"].typos            # noted in remarks even if the geocode won
-        elif best["cat"] == "AREA_LEVEL":
+        elif best["cat"] == "INCOMPLETE_ADDRESS":
             res["place_reject"] = best["ev"].reason or None
     res["variants"] = spelling_variants(ctx, g["formatted_address"]) if g["found"] else []
     res["formatted_address"] = g["formatted_address"]
@@ -1569,7 +1569,7 @@ def _poi_result(best: dict, g: dict, ver: dict) -> dict:
     place, ev = best["place"], best["ev"]
     loc = place["geometry"]["location"]
     name = (place.get("name") or "").strip()
-    kind = {"LANDMARK_EXACT": "LANDMARK_PLACE_MATCH", "AREA_LEVEL": "AREA_PLACE_MATCH"}.get(
+    kind = {"LANDMARK_EXACT": "LANDMARK_PLACE_MATCH", "INCOMPLETE_ADDRESS": "INCOMPLETE_PLACE_MATCH"}.get(
         best["cat"], "POI_PLACE_MATCH")
     return _blank_result(
         lat=loc["lat"], lng=loc["lng"], status="OK (PLACES_API_MATCH)", source_api="PLACES_API",
@@ -1887,7 +1887,7 @@ def build_remarks(res: dict, flags) -> str:
         parts.append("Street-level estimate (interpolated); exact house number not confirmed.")
     elif cat == "STREET_LEVEL":
         parts.append("Only the street was located; no house-level match.")
-    elif cat in ("AREA_LEVEL", "INCOMPLETE_ADDRESS"):
+    elif cat == "INCOMPLETE_ADDRESS":
         details = res.get("completeness_details")
         if details:
             subcat = details.get("subcat")
@@ -1914,10 +1914,10 @@ def build_remarks(res: dict, flags) -> str:
         elif "GEOCODE_UNVERIFIED" in flags:
             parts.append(f"Google's result ('{fa[:80]}') disagrees with the input pincode/locality, so it is not trusted.")
         elif lt in ("APPROXIMATE", "GEOMETRIC_CENTER"):
-            parts.append(f"Area-level match: only the area/locality was found ({lt}); "
+            parts.append(f"Incomplete address match: only the area/locality was found ({lt}); "
                          f"no building, street or landmark matched.")
         else:
-            parts.append("Area-level match: nothing specific enough could be matched.")
+            parts.append("Incomplete address match: nothing specific enough could be matched.")
         if place and res.get("place_reject"):
             parts.append(f"Places returned '{place}' but it was rejected: "
                          f"{_REJECT_TEXT.get(res['place_reject'], res['place_reject'])}.")

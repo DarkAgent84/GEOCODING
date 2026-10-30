@@ -44,6 +44,65 @@ def get_conn():
 def create_tables(conn, schema="public"):
     ensure_db_tables(conn, schema, input_table="geocoding", output_table="geocoding_processed", cache_table="geocode_cache")
 
+def load_input_csv(conn, csv_path="GEOCODING.csv", schema="public", table="geocoding", batch_size=1000):
+    """Load or reload GEOCODING.csv into PostgreSQL with upsert."""
+    if not os.path.isfile(csv_path):
+        print(f"ERROR: File not found: {csv_path}")
+        return
+    create_tables(conn, schema)
+    print(f"Reading {csv_path}...")
+    try:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False, encoding="cp1252")
+    df.columns = [c.strip() for c in df.columns]
+
+    loan_col = "soa_loan_no"
+    if loan_col not in df.columns:
+        print(f"ERROR: Primary key column '{loan_col}' not found in {csv_path}. Columns found: {list(df.columns)}")
+        return
+
+    curr_addr_col = "soa_current_address" if "soa_current_address" in df.columns else None
+    prop_addr_col = "soa_property_address" if "soa_property_address" in df.columns else None
+    foll_addr_col = "follow_new_address" if "follow_new_address" in df.columns else None
+
+    total = len(df)
+    print(f"Uploading {total} records into {schema}.{table}...")
+
+    cur = conn.cursor()
+    insert_sql = f"""
+    INSERT INTO {schema}.{table} (soa_loan_no, soa_current_address, soa_property_address, follow_new_address)
+    VALUES %s
+    ON CONFLICT (soa_loan_no) DO UPDATE SET
+        soa_current_address = EXCLUDED.soa_current_address,
+        soa_property_address = EXCLUDED.soa_property_address,
+        follow_new_address = EXCLUDED.follow_new_address;
+    """
+
+    records = []
+    for i, row in df.iterrows():
+        rec = (
+            str(row[loan_col]).strip(),
+            str(row[curr_addr_col]).strip() if curr_addr_col else "",
+            str(row[prop_addr_col]).strip() if prop_addr_col else "",
+            str(row[foll_addr_col]).strip() if foll_addr_col else ""
+        )
+        records.append(rec)
+        if len(records) >= batch_size:
+            extras.execute_values(cur, insert_sql, records, page_size=len(records))
+            conn.commit()
+            records.clear()
+            print(f"  [Progress] Uploaded {i + 1}/{total} rows...")
+
+    if records:
+        extras.execute_values(cur, insert_sql, records, page_size=len(records))
+        conn.commit()
+        records.clear()
+
+    cur.close()
+    print(f"Done! Successfully pushed {total} rows to {schema}.{table}.\n")
+
+
 def print_status(conn, schema="public"):
     create_tables(conn, schema)
     cur = conn.cursor()
@@ -73,11 +132,20 @@ def print_status(conn, schema="public"):
 def main():
     p = argparse.ArgumentParser(description="Manage PostgreSQL tables for geocoding.")
     p.add_argument("--status", action="store_true", help="Print table row counts and pending items")
+    p.add_argument("--reload-input", action="store_true", help="Push/reload GEOCODING.csv into PostgreSQL table 'geocoding'")
+    p.add_argument("--input", "-i", default="GEOCODING.csv", help="Input CSV path (default: GEOCODING.csv)")
+    p.add_argument("--schema", default=None, help="PostgreSQL schema (default: from .env or public)")
     args = p.parse_args()
 
     conn = get_conn()
-    schema = os.environ.get("DB_SCHEMA", "public")
-    print_status(conn, schema)
+    schema = args.schema or os.environ.get("DB_SCHEMA", "public")
+
+    if args.reload_input:
+        load_input_csv(conn, csv_path=args.input, schema=schema, table="geocoding")
+        print_status(conn, schema)
+    else:
+        print_status(conn, schema)
+
     conn.close()
 
 if __name__ == "__main__":

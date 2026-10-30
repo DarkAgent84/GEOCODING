@@ -941,10 +941,10 @@ def test_complete_address_with_area_level_geocode_scores_area_level():
 
     assert row["address_completeness_status"] == "COMPLETE"
     assert row["confidence_score"] == 10
-    assert row["score_category"] == "AREA_LEVEL"
-    assert row["match_classification"] == "AREA_LEVEL"
-    assert row["processing_stage"] == "STAGE_GEOCODING_AREA"
-    assert "Area-level match" in row["remarks"]
+    assert row["score_category"] == "INCOMPLETE_ADDRESS"
+    assert row["match_classification"] == "INCOMPLETE_ADDRESS"
+    assert row["processing_stage"] == "STAGE_GEOCODING_INCOMPLETE"
+    assert "Incomplete address match" in row["remarks"]
 
 # --------------------------------------------------------------------------
 # Multiprocessing and Concurrency Tests
