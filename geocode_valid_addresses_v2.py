@@ -1016,7 +1016,7 @@ def geocode_score(g: dict):
     if "route" in types and not (types & {"street_address", "premise", "subpremise",
                                           "establishment", "point_of_interest"}):
         return SCORE_STREET, "STREET_LEVEL"
-    return SCORE_INCOMPLETE, "INCOMPLETE_ADDRESS"        # locality centre / area-level / unknown
+    return SCORE_AREA_LEVEL, "AREA_LEVEL"        # locality centre / area-level / unknown
 
 
 def verify_geocode(ctx: AddrCtx, g: dict) -> dict:
@@ -1397,8 +1397,8 @@ def _derive_core(address: str, client) -> dict:
     unverified = False
     if hard_fail:
         flags.append("GEOCODE_UNVERIFIED")
-        if g_score > SCORE_INCOMPLETE:
-            g_score, g_cat, unverified = SCORE_AREA_LEVEL, "INCOMPLETE_ADDRESS", True
+        if g_score > SCORE_AREA_LEVEL:
+            g_score, g_cat, unverified = SCORE_AREA_LEVEL, "AREA_LEVEL", True
     elif g["found"] and ver["status"] == "PIN_MISMATCH":
         flags.append("PIN_MISMATCH_CORROBORATED")
     trusted = g["found"] and not hard_fail
@@ -1450,7 +1450,7 @@ def _derive_core(address: str, client) -> dict:
             stage = "STAGE_GEOCODING_PARTIAL" if g_cat == "PARTIAL_MATCH" else (
                     "STAGE_GEOCODING_INTERPOLATED" if g_cat == "INTERPOLATED" else (
                     "STAGE_GEOCODING_STREET" if g_cat == "STREET_LEVEL" else "STAGE_GEOCODING_AREA"))
-            match_cls = g_cat if g_cat != "INCOMPLETE_ADDRESS" else "AREA_LEVEL"
+            match_cls = g_cat
             res = _blank_result(
                 lat=g["lat"], lng=g["lng"], status=g["status"], source_api="GEOCODING_API_FALLBACK",
                 derivation_type=f"PARTIAL_{lt}" + ("_UNVERIFIED" if unverified else ""),
@@ -1664,7 +1664,7 @@ def build_remarks(res: dict, flags) -> str:
         parts.append("Street-level estimate (interpolated); exact house number not confirmed.")
     elif cat == "STREET_LEVEL":
         parts.append("Only the street was located; no house-level match.")
-    elif cat == "INCOMPLETE_ADDRESS":
+    elif cat in ("AREA_LEVEL", "INCOMPLETE_ADDRESS"):
         details = res.get("completeness_details")
         if details:
             subcat = details.get("subcat")
@@ -1693,10 +1693,10 @@ def build_remarks(res: dict, flags) -> str:
         elif "TOO_FEW_WORDS" in flags:
             parts.append("Too few place words to locate the address.")
         elif lt in ("APPROXIMATE", "GEOMETRIC_CENTER"):
-            parts.append(f"Incomplete address: only the area/locality was found ({lt}); "
+            parts.append(f"Area-level match: only the area/locality was found ({lt}); "
                          f"no building, street or landmark matched.")
         else:
-            parts.append("Incomplete address: nothing specific enough could be matched.")
+            parts.append("Area-level match: nothing specific enough could be matched.")
         if place and res.get("place_reject"):
             parts.append(f"Places returned '{place}' but it was rejected: "
                          f"{_REJECT_TEXT.get(res['place_reject'], res['place_reject'])}.")

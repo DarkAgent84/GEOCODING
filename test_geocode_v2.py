@@ -929,4 +929,19 @@ def test_e2e_random_sampling_with_seed(tmp_path):
     assert len(sampled_indices) == 2
 
 
+def test_complete_address_with_area_level_geocode_scores_area_level():
+    # Input address is COMPLETE (valid pin, 3+ words, >= 15 chars), but Google only finds locality centroid
+    geo_mock = geo(23.48, 80.10, "APPROXIMATE", "Sihora, Madhya Pradesh 483225, India", types=["locality"])
+    addr = "WARD NO 17 UMARIYA ROAD KHITOLA BASTI SIHORA SHIV MANDIR - 483225"
+    res, _ = run(addr, geo_mock)
+    row = v2.build_row(1, "LOAN001", "addr", addr, addr, res, [])
+
+    assert row["address_completeness_status"] == "COMPLETE"
+    assert row["confidence_score"] == 10
+    assert row["score_category"] == "AREA_LEVEL"
+    assert row["match_classification"] == "AREA_LEVEL"
+    assert row["processing_stage"] == "STAGE_GEOCODING_AREA"
+    assert "Area-level match" in row["remarks"]
+
+
 
