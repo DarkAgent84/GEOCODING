@@ -18,7 +18,7 @@ v2_candidates = [
     os.path.join(HERE, "..", "geocode_valid_addresses_v2.py"),
     os.path.join(HERE, "..", "src", "geocode_valid_addresses_v2.py"),
 ]
-v2_path = next((c for c in v2_candidates if os.path.exists(c)), v2_candidates[1])
+v2_path = next((c for c in v2_candidates if os.path.exists(c)), v2_candidates[-1])
 spec = importlib.util.spec_from_file_location("v2", v2_path)
 v2 = importlib.util.module_from_spec(spec)
 sys.modules["v2"] = v2

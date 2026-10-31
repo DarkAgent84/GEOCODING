@@ -12,9 +12,9 @@ param(
 
 # Resolve project root directory regardless of invocation location
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (Test-Path "$ScriptDir\geocode_valid_addresses_v2.py") {
+if (Test-Path "$ScriptDir\src\geocode_valid_addresses_v2.py") {
     $ProjectRoot = $ScriptDir
-} elseif (Test-Path "$ScriptDir\..\geocode_valid_addresses_v2.py") {
+} elseif (Test-Path "$ScriptDir\..\src\geocode_valid_addresses_v2.py") {
     $ProjectRoot = (Resolve-Path "$ScriptDir\..").Path
 } else {
     $ProjectRoot = (Get-Location).Path
@@ -23,7 +23,7 @@ Set-Location $ProjectRoot
 
 # If arguments were provided directly on the CLI, forward them directly to Python
 if ($ScriptArgs.Count -gt 0) {
-    & python geocode_valid_addresses_v2.py @ScriptArgs
+    & python src/geocode_valid_addresses_v2.py @ScriptArgs
     exit $LASTEXITCODE
 }
 
@@ -53,31 +53,31 @@ while ($true) {
     switch ($choice) {
         "1" {
             Write-Host "`n[INFO] Running Pipeline in Database Offline Mode (--db --no-api)..." -ForegroundColor Green
-            & python geocode_valid_addresses_v2.py --db --no-api --workers 8 --batch-size 50
+            & python src/geocode_valid_addresses_v2.py --db --no-api --workers 8 --batch-size 50
         }
         "2" {
             Write-Host "`n[WARNING] This will call Google Maps Geocoding and Places API!" -ForegroundColor Yellow
             $confirm = Read-Host "Do you wish to proceed? (Y/N)"
             if ($confirm -eq "Y" -or $confirm -eq "y") {
                 Write-Host "[INFO] Running Pipeline in Database Live Mode (--db)..." -ForegroundColor Yellow
-                & python geocode_valid_addresses_v2.py --db --workers 8 --batch-size 50
+                & python src/geocode_valid_addresses_v2.py --db --workers 8 --batch-size 50
             }
         }
         "3" {
             Write-Host "`n[INFO] Running Pipeline in CSV Offline Mode (No API)..." -ForegroundColor Green
-            & python geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
+            & python src/geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
         }
         "4" {
             Write-Host "`n[WARNING] This will call Google Maps Geocoding and Places API!" -ForegroundColor Yellow
             $confirm = Read-Host "Do you wish to proceed? (Y/N)"
             if ($confirm -eq "Y" -or $confirm -eq "y") {
                 Write-Host "[INFO] Running Pipeline in CSV Live Mode..." -ForegroundColor Yellow
-                & python geocode_valid_addresses_v2.py --workers 8 --batch-size 50
+                & python src/geocode_valid_addresses_v2.py --workers 8 --batch-size 50
             }
         }
         "5" {
             Write-Host "`n[INFO] Checking PostgreSQL Database Status..." -ForegroundColor Cyan
-            & python init_postgres.py --status
+            & python scripts/init_postgres.py --status
         }
         "6" {
             Write-Host "`n[INFO] Running Pytest Test Suite..." -ForegroundColor Cyan

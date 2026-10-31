@@ -5,9 +5,9 @@
 
 # Resolve project root directory regardless of invocation location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/geocode_valid_addresses_v2.py" ]; then
+if [ -f "$SCRIPT_DIR/src/geocode_valid_addresses_v2.py" ]; then
     PROJECT_ROOT="$SCRIPT_DIR"
-elif [ -f "$SCRIPT_DIR/../geocode_valid_addresses_v2.py" ]; then
+elif [ -f "$SCRIPT_DIR/../src/geocode_valid_addresses_v2.py" ]; then
     PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 else
     PROJECT_ROOT="$(pwd)"
@@ -16,7 +16,7 @@ cd "$PROJECT_ROOT"
 
 # If arguments are provided on command line, pass them directly to the python script
 if [ "$#" -gt 0 ]; then
-    python3 geocode_valid_addresses_v2.py "$@"
+    python3 src/geocode_valid_addresses_v2.py "$@"
     exit $?
 fi
 
@@ -43,7 +43,7 @@ while true; do
         1)
             echo ""
             echo "[INFO] Running Pipeline in Database Offline Mode (--db --no-api)..."
-            python3 geocode_valid_addresses_v2.py --db --no-api --workers 8 --batch-size 50
+            python3 src/geocode_valid_addresses_v2.py --db --no-api --workers 8 --batch-size 50
             ;;
         2)
             echo ""
@@ -51,13 +51,13 @@ while true; do
             read -p "Do you wish to proceed? (y/n): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 echo "[INFO] Running Pipeline in Database Live Mode (--db)..."
-                python3 geocode_valid_addresses_v2.py --db --workers 8 --batch-size 50
+                python3 src/geocode_valid_addresses_v2.py --db --workers 8 --batch-size 50
             fi
             ;;
         3)
             echo ""
             echo "[INFO] Running Pipeline in CSV Offline Mode (No API)..."
-            python3 geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
+            python3 src/geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
             ;;
         4)
             echo ""
@@ -65,13 +65,13 @@ while true; do
             read -p "Do you wish to proceed? (y/n): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 echo "[INFO] Running Pipeline in CSV Live Mode..."
-                python3 geocode_valid_addresses_v2.py --workers 8 --batch-size 50
+                python3 src/geocode_valid_addresses_v2.py --workers 8 --batch-size 50
             fi
             ;;
         5)
             echo ""
             echo "[INFO] Checking PostgreSQL Database Status..."
-            python3 init_postgres.py --status
+            python3 scripts/init_postgres.py --status
             ;;
         6)
             echo ""

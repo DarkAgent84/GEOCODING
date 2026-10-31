@@ -50,18 +50,18 @@ GOOGLE_API_KEY=your_google_maps_api_key
 ### Check Database Connection & Table Row Counts
 Prints input records, processed records, cached API responses, and pending records to geocode:
 ```powershell
-python init_postgres.py --status
+python scripts/init_postgres.py --status
 ```
 
 ### Push / Reload `GEOCODING.csv` to PostgreSQL
 Uploads/upserts all 10,258 records into `public.geocoding`:
 ```powershell
-python init_postgres.py --reload-input
+python scripts/init_postgres.py --reload-input
 ```
 
 ### Push a Custom CSV File into a Specific Schema
 ```powershell
-python init_postgres.py --reload-input --input custom_addresses.csv --schema public
+python scripts/init_postgres.py --reload-input --input custom_addresses.csv --schema public
 ```
 
 ---
@@ -72,32 +72,32 @@ Runs Stages 1–4 (Incomplete check, Conflicting PINs, Spelling check, Synonym n
 
 ### Run Entire CSV Offline with 8 Parallel Workers
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_validated.csv --no-api --workers 8
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_validated.csv --no-api --workers 8
 ```
 
 ### Run with Short Flag (`-w`) and Larger Batch Flushing
 ```powershell
-python geocode_valid_addresses_v2.py -i GEOCODING.csv -o GEOCODING_validated.csv --no-api -w 8 -b 50 --overwrite
+python src/geocode_valid_addresses_v2.py -i GEOCODING.csv -o GEOCODING_validated.csv --no-api -w 8 -b 50 --overwrite
 ```
 
 ### Using Pre-API Aliases
 ```powershell
 # Using --pre-api-only:
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output validated.csv --pre-api-only -w 8
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output validated.csv --pre-api-only -w 8
 
 # Using --validate-only:
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output validated.csv --validate-only -w 8
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output validated.csv --validate-only -w 8
 ```
 
 ### Run Offline Pre-API Validation in PostgreSQL Database Mode
 Reads from `public.geocoding` and saves to `public.geocoding_processed` with 0 API calls:
 ```powershell
-python geocode_valid_addresses_v2.py --db --no-api --workers 8
+python src/geocode_valid_addresses_v2.py --db --no-api --workers 8
 ```
 
 ### Validate an Offline Sample (e.g. 100 Rows)
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample_pre_api.csv --no-api --limit 100 --overwrite
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample_pre_api.csv --no-api --limit 100 --overwrite
 ```
 
 ---
@@ -108,12 +108,12 @@ Cleans and sanitizes all addresses, counts usable vs invalid rows, deduplicates 
 
 ### Dry Run on CSV
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --dry-run
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --dry-run
 ```
 
 ### Dry Run on PostgreSQL
 ```powershell
-python geocode_valid_addresses_v2.py --db --dry-run
+python src/geocode_valid_addresses_v2.py --db --dry-run
 ```
 
 ---
@@ -124,27 +124,27 @@ Executes the full 6-stage pipeline (Stages 1–4 pre-filtering + Stage 5/6 Googl
 
 ### Standard CSV Run with Multi-Worker Parallelism
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 4 --max-qps 10
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 4 --max-qps 10
 ```
 
 ### High-Throughput Production Run (8 Workers, 15 QPS)
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv -w 8 --max-qps 15 -b 50
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv -w 8 --max-qps 15 -b 50
 ```
 
 ### Standard PostgreSQL Database Mode
 ```powershell
-python geocode_valid_addresses_v2.py --db --workers 8 --max-qps 12 --batch-size 50
+python src/geocode_valid_addresses_v2.py --db --workers 8 --max-qps 12 --batch-size 50
 ```
 
 ### Custom Input and Output Columns
 ```powershell
-python geocode_valid_addresses_v2.py --input custom_leads.csv --output custom_out.csv --address-col "customer_address" --loan-col "lead_id"
+python src/geocode_valid_addresses_v2.py --input custom_leads.csv --output custom_out.csv --address-col "customer_address" --loan-col "lead_id"
 ```
 
 ### Start Fresh Overwrite (Renames Old File with Timestamp Backup)
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --overwrite
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --overwrite
 ```
 
 ---
@@ -153,23 +153,23 @@ python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_pr
 
 ### Geocode N Random Unprocessed Rows
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample.csv --limit 20 --random
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample.csv --limit 20 --random
 ```
 
 ### Quick Shortcut Flag (`--sample N`)
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample.csv --sample 25
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample.csv --sample 25
 ```
 
 ### Reproducible Random Sampling (with Fixed Seed)
 Repeat the exact same sample across multiple test runs:
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample.csv --sample 50 --seed 42
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output sample.csv --sample 50 --seed 42
 ```
 
 ### Database Mode Sampling
 ```powershell
-python geocode_valid_addresses_v2.py --db --sample 20 --seed 123
+python src/geocode_valid_addresses_v2.py --db --sample 20 --seed 123
 ```
 
 ---
@@ -179,27 +179,27 @@ python geocode_valid_addresses_v2.py --db --sample 20 --seed 123
 ### Zero-Cost Re-scoring from Disk Cache (`--cache-only`)
 Re-evaluates scores, classifications, and geofences purely from the local SQLite/PostgreSQL cache without making any Google API calls. Rows not found in the cache are skipped:
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output rescored.csv --cache-only
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output rescored.csv --cache-only
 ```
 
 ### Set Hard Ceiling on API Spend (`--max-api-calls`)
 Automatically halts processing once the API call budget is reached while safely flushing all completed progress:
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output out.csv --max-api-calls 200
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output out.csv --max-api-calls 200
 ```
 
 ### Custom Cache Expiration (Google 30-Day TTL Compliance)
 ```powershell
 # Cache expires after 15 days:
-python geocode_valid_addresses_v2.py --cache-max-age-days 15
+python src/geocode_valid_addresses_v2.py --cache-max-age-days 15
 
 # Never expire cache (0 = unlimited):
-python geocode_valid_addresses_v2.py --cache-max-age-days 0
+python src/geocode_valid_addresses_v2.py --cache-max-age-days 0
 ```
 
 ### Disable Cache Completely (Forces Live API Requests)
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output fresh.csv --no-cache
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output fresh.csv --no-cache
 ```
 
 ---
@@ -209,17 +209,17 @@ python geocode_valid_addresses_v2.py --input GEOCODING.csv --output fresh.csv --
 ### Resume an Interrupted Run
 Simply re-run the same command! The script reads the existing output file, skips already completed rows, and resumes where it left off:
 ```powershell
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 8
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 8
 ```
 
 ### Retry Failed Processing Errors (`--retry-errors`)
 Removes previously logged `PROCESSING_ERROR` rows from the output CSV / database and re-processes them:
 ```powershell
 # CSV mode:
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --retry-errors
+python src/geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --retry-errors
 
 # Database mode:
-python geocode_valid_addresses_v2.py --db --retry-errors
+python src/geocode_valid_addresses_v2.py --db --retry-errors
 ```
 
 ---

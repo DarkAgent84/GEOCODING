@@ -268,18 +268,20 @@ GEOCODING/
 ├── README.md                  # Project overview & documentation
 ├── COMMANDS.md                # Comprehensive CLI command cheatsheet
 ├── requirements.txt           # Python dependencies
-├── geocode_valid_addresses_v2.py # Root CLI entrypoint (100% backward-compatible)
-├── init_postgres.py           # Database setup and status utility
-├── run_pipeline.bat           # 1-click Windows runner & menu
-├── run_pipeline.ps1           # PowerShell interactive runner
-├── run_pipeline.sh            # Linux/macOS/Bash runner
+│
+├── src/                              # Core Application Engine
+│   └── geocode_valid_addresses_v2.py # Comprehensive geocoding, scoring & validation engine
+
+
+
+
 │
 ├── data/                      # Structured Data
 │   ├── input/
 │   │   └── GEOCODING.csv      # Raw input addresses (10,258 records)
 │   ├── output/
 │   │   ├── GEOCODING_processed.csv       # Processed results with scores & coordinates
-│   │   └── geocoding_processed_result1.csv
+
 │   └── cache/
 │       └── geocode_cache.db   # Local persistent SQLite API cache (WAL mode)
 │
