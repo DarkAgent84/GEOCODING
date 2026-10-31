@@ -62,6 +62,23 @@ python scripts/init_postgres.py --reload-input
 ### Push a Custom CSV File into a Specific Schema
 ```powershell
 python scripts/init_postgres.py --reload-input --input custom_addresses.csv --schema public
+`
+
+### Calculate Distance Between Geocoded & Follow-up Coordinates (calculate_followup_distance.py)
+Calculates the Haversine distance between (gp_latitude, gp_longitude) and (follow_current_lat, follow_current_long) for records where gp_confidence_score > 60 from soa_follow_curr_addr_analysis. Stores results in a dedicated table containing only dc_loan_number, gp_lat_long, ollow_current_lat_long, and distance:
+
+`powershell
+# 1. Preview records without modifying database (Dry Run)
+python scripts/calculate_followup_distance.py --dry-run
+
+# 2. Run distance calculation in kilometers (default target: soa_follow_curr_addr_distance)
+python scripts/calculate_followup_distance.py --unit km
+
+# 3. Run distance calculation in meters
+python scripts/calculate_followup_distance.py --unit m
+
+# 4. Custom target table and export to CSV
+python scripts/calculate_followup_distance.py --target-table my_distance_table --export-csv distance_results.csv
 ```
 
 ---
