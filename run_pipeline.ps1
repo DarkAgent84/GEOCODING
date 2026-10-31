@@ -26,8 +26,8 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  [1] Offline DB Validation     (Stage 1-4, 0 Google API calls, Free)" -ForegroundColor Green
     Write-Host "  [2] Live DB Geocoding         (PostgreSQL + Google Geocoding/Places API)" -ForegroundColor Yellow
-    Write-Host "  [3] Offline CSV Validation    (GEOCODING.csv -> GEOCODING_processed.csv, No API)" -ForegroundColor Green
-    Write-Host "  [4] Live CSV Geocoding        (GEOCODING.csv -> GEOCODING_processed.csv)" -ForegroundColor Yellow
+    Write-Host "  [3] Offline CSV Validation    (data/input/GEOCODING.csv -> data/output/, No API)" -ForegroundColor Green
+    Write-Host "  [4] Live CSV Geocoding        (data/input/GEOCODING.csv -> data/output/)" -ForegroundColor Yellow
     Write-Host "  [5] Check PostgreSQL Status   (Verifies connection and table row counts)" -ForegroundColor White
     Write-Host "  [6] Run Pytest Test Suite     (Executes all 108 unit/regression tests)" -ForegroundColor White
     Write-Host "  [7] Exit"
@@ -53,15 +53,15 @@ while ($true) {
             }
         }
         "3" {
-            Write-Host "`n[INFO] Running Pipeline in CSV Offline Mode (--input GEOCODING.csv --no-api)..." -ForegroundColor Green
-            & python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --no-api --workers 8 --batch-size 50
+            Write-Host "`n[INFO] Running Pipeline in CSV Offline Mode (--no-api)..." -ForegroundColor Green
+            & python geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
         }
         "4" {
             Write-Host "`n[WARNING] This will call Google Maps Geocoding and Places API!" -ForegroundColor Yellow
             $confirm = Read-Host "Do you wish to proceed? (Y/N)"
             if ($confirm -eq "Y" -or $confirm -eq "y") {
                 Write-Host "[INFO] Running Pipeline in CSV Live Mode..." -ForegroundColor Yellow
-                & python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 8 --batch-size 50
+                & python geocode_valid_addresses_v2.py --workers 8 --batch-size 50
             }
         }
         "5" {
@@ -70,7 +70,7 @@ while ($true) {
         }
         "6" {
             Write-Host "`n[INFO] Running Pytest Test Suite..." -ForegroundColor Cyan
-            & pytest test_geocode_v2.py -v
+            & pytest tests/test_geocode_v2.py -v
         }
         "7" {
             Write-Host "Exiting..."

@@ -21,8 +21,8 @@ echo Please select an operation mode:
 echo.
 echo   [1] Offline DB Validation     (Stage 1-4, 0 Google API calls, Free)
 echo   [2] Live DB Geocoding         (PostgreSQL + Google Geocoding/Places API)
-echo   [3] Offline CSV Validation    (GEOCODING.csv -^> GEOCODING_processed.csv, No API)
-echo   [4] Live CSV Geocoding        (GEOCODING.csv -^> GEOCODING_processed.csv)
+echo   [3] Offline CSV Validation    (data/input/GEOCODING.csv -^> data/output/, No API)
+echo   [4] Live CSV Geocoding        (data/input/GEOCODING.csv -^> data/output/)
 echo   [5] Check PostgreSQL Status   (Verifies connection and table row counts)
 echo   [6] Run Pytest Test Suite     (Executes all 108 unit/regression tests)
 echo   [7] Exit
@@ -59,8 +59,8 @@ goto FINISHED
 
 :OFFLINE_CSV
 echo.
-echo [INFO] Running Pipeline in CSV Offline Mode (--input GEOCODING.csv --no-api)...
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --no-api --workers 8 --batch-size 50
+echo [INFO] Running Pipeline in CSV Offline Mode (--no-api)...
+python geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
 goto FINISHED
 
 :LIVE_CSV
@@ -69,7 +69,7 @@ echo [WARNING] This will call Google Maps Geocoding and Places API!
 set /p confirm="Do you wish to proceed? (Y/N): "
 if /i not "%confirm%"=="Y" goto MENU
 echo [INFO] Running Pipeline in CSV Live Mode...
-python geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 8 --batch-size 50
+python geocode_valid_addresses_v2.py --workers 8 --batch-size 50
 goto FINISHED
 
 :CHECK_DB
@@ -81,7 +81,7 @@ goto FINISHED
 :RUN_TESTS
 echo.
 echo [INFO] Running Pytest Test Suite...
-pytest test_geocode_v2.py -v
+pytest tests/test_geocode_v2.py -v
 goto FINISHED
 
 :FINISHED

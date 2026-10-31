@@ -13,7 +13,12 @@ import pytest
 import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location("v2", os.path.join(HERE, "geocode_valid_addresses_v2.py"))
+v2_candidates = [
+    os.path.join(HERE, "geocode_valid_addresses_v2.py"),
+    os.path.join(HERE, "..", "geocode_valid_addresses_v2.py"),
+]
+v2_path = next((c for c in v2_candidates if os.path.exists(c)), v2_candidates[1])
+spec = importlib.util.spec_from_file_location("v2", v2_path)
 v2 = importlib.util.module_from_spec(spec)
 sys.modules["v2"] = v2
 spec.loader.exec_module(v2)
@@ -415,7 +420,7 @@ def test_missing_key_aborts_cleanly():
 
 
 def test_key_is_not_hardcoded():
-    src = open(os.path.join(HERE, "geocode_valid_addresses_v2.py"), encoding="utf-8").read()
+    src = open(v2_path, encoding="utf-8").read()
     assert "AIza" not in src
 
 
@@ -1032,7 +1037,8 @@ def test_real_multiprocessing_pool_with_sqlite_cache(tmp_path):
     cache.close()
 
     import subprocess
-    script_path = os.path.join(HERE, "geocode_valid_addresses_v2.py")
+    script_path = v2_path
+    root_dir = os.path.dirname(v2_path)
     res = subprocess.run([
         sys.executable, script_path,
         "-i", in_csv,
@@ -1041,7 +1047,7 @@ def test_real_multiprocessing_pool_with_sqlite_cache(tmp_path):
         "--cache-only",
         "--workers", "2",
         "--worker-mode", "process"
-    ], cwd=HERE, capture_output=True, text=True)
+    ], cwd=root_dir, capture_output=True, text=True)
 
     assert res.returncode == 0
     rows = read_out(out_csv)

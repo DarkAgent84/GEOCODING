@@ -247,11 +247,69 @@ python geocode_valid_addresses_v2.py --cache-only
 
 ## 🧪 Testing
 
-Run the offline test suite (no network or API key required):
+Run the automated test suite (no network or API key required):
 ```bash
-pytest test_geocode_v2.py -v
+pytest tests/test_geocode_v2.py -v
 ```
-**Results**: 108 tests passing in ~7.9 seconds.
+Or simply:
+```bash
+pytest
+```
+**Results**: 108 tests passing in ~4.0 seconds.
+
+---
+
+## 📁 Project Directory Layout
+
+```
+GEOCODING/
+├── .env                       # Local environment variables & secrets (ignored in git)
+├── .env.example               # Template environment configuration
+├── README.md                  # Project overview & documentation
+├── COMMANDS.md                # Comprehensive CLI command cheatsheet
+├── requirements.txt           # Python dependencies
+├── geocode_valid_addresses_v2.py # Root CLI entrypoint (100% backward-compatible)
+├── init_postgres.py           # Database setup and status utility
+├── run_pipeline.bat           # 1-click Windows runner & menu
+├── run_pipeline.ps1           # PowerShell interactive runner
+├── run_pipeline.sh            # Linux/macOS/Bash runner
+│
+├── data/                      # Structured Data
+│   ├── input/
+│   │   └── GEOCODING.csv      # Raw input addresses (10,258 records)
+│   ├── output/
+│   │   ├── GEOCODING_processed.csv       # Processed results with scores & coordinates
+│   │   └── geocoding_processed_result1.csv
+│   └── cache/
+│       └── geocode_cache.db   # Local persistent SQLite API cache (WAL mode)
+│
+├── docs/                      # Documentation
+│   └── ARCHITECTURE.md        # Modular code architecture & system design
+│
+├── scripts/                   # Operations & Initialization Scripts
+│   ├── init_postgres.py
+│   ├── run_pipeline.bat
+│   ├── run_pipeline.ps1
+│   └── run_pipeline.sh
+│
+├── src/                       # Modular Python Source Code
+│   └── geocoding/
+│       ├── __init__.py        # Public package interface
+│       ├── constants.py       # Scores, thresholds, vocabulary sets, exceptions
+│       ├── config.py          # Dynamic path resolution & .env loader
+│       ├── text_utils.py      # Normalization, token similarity, Haversine
+│       ├── validation.py      # Stages 1-4 (Incomplete, Pincodes, Spelling, Synonyms)
+│       ├── google_client.py   # ApiClient, QPS rate limiter, backoff, trimming
+│       ├── cache.py           # DiskCache (SQLite) & PostgresCache (PostgreSQL)
+│       ├── scoring.py         # Place evaluation, geofence radius, remarks builder
+│       ├── db.py              # PostgreSQL streaming batches, migrations, upserts
+│       ├── pipeline.py        # Worker thread pool, deterministic row order, CSV locking
+│       └── cli.py             # CLI argument parser & main execution runner
+│
+└── tests/                     # Automated Test Suite
+    ├── __init__.py
+    └── test_geocode_v2.py     # 108 unit, mock, integration & regression tests
+```
 
 ---
 

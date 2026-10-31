@@ -3,7 +3,6 @@
 # Credility Geocoding Pipeline Runner (Linux / macOS / Bash Script)
 # ==============================================================================
 
-# If arguments are provided on command line, pass them directly to the python script
 if [ "$#" -gt 0 ]; then
     python3 geocode_valid_addresses_v2.py "$@"
     exit $?
@@ -19,8 +18,8 @@ while true; do
     echo ""
     echo "  [1] Offline DB Validation     (Stage 1-4, 0 Google API calls, Free)"
     echo "  [2] Live DB Geocoding         (PostgreSQL + Google Geocoding/Places API)"
-    echo "  [3] Offline CSV Validation    (GEOCODING.csv -> GEOCODING_processed.csv, No API)"
-    echo "  [4] Live CSV Geocoding        (GEOCODING.csv -> GEOCODING_processed.csv)"
+    echo "  [3] Offline CSV Validation    (data/input/GEOCODING.csv -> data/output/, No API)"
+    echo "  [4] Live CSV Geocoding        (data/input/GEOCODING.csv -> data/output/)"
     echo "  [5] Check PostgreSQL Status   (Verifies connection and table row counts)"
     echo "  [6] Run Pytest Test Suite     (Executes all 108 unit/regression tests)"
     echo "  [7] Exit"
@@ -45,8 +44,8 @@ while true; do
             ;;
         3)
             echo ""
-            echo "[INFO] Running Pipeline in CSV Offline Mode (--input GEOCODING.csv --no-api)..."
-            python3 geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --no-api --workers 8 --batch-size 50
+            echo "[INFO] Running Pipeline in CSV Offline Mode (--no-api)..."
+            python3 geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
             ;;
         4)
             echo ""
@@ -54,7 +53,7 @@ while true; do
             read -p "Do you wish to proceed? (y/n): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 echo "[INFO] Running Pipeline in CSV Live Mode..."
-                python3 geocode_valid_addresses_v2.py --input GEOCODING.csv --output GEOCODING_processed.csv --workers 8 --batch-size 50
+                python3 geocode_valid_addresses_v2.py --workers 8 --batch-size 50
             fi
             ;;
         5)
@@ -65,7 +64,7 @@ while true; do
         6)
             echo ""
             echo "[INFO] Running Pytest Test Suite..."
-            pytest test_geocode_v2.py -v
+            pytest tests/test_geocode_v2.py -v
             ;;
         7)
             echo "Exiting..."
