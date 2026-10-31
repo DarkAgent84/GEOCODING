@@ -230,30 +230,30 @@ Run the offline pytest test suite (108 tests, 100% offline, requires no network 
 
 ### Run Entire Test Suite
 ```powershell
-pytest test_geocode_v2.py
+pytest
 ```
 
 ### Run with Verbose Test Details
 ```powershell
-pytest test_geocode_v2.py -v
+pytest -v
 ```
 
 ### Run Tests Matching Specific Keywords
 ```powershell
 # Run all concurrency and worker tests:
-pytest test_geocode_v2.py -k "worker" -v
+pytest -k "worker" -v
 
 # Run all offline pre-API validation tests:
-pytest test_geocode_v2.py -k "no_api" -v
+pytest -k "no_api" -v
 
 # Run all Stage 1 incomplete address tests:
-pytest test_geocode_v2.py -k "incomplete" -v
+pytest -k "incomplete" -v
 
 # Run all low confidence / area match tests:
-pytest test_geocode_v2.py -k "low_confidence" -v
+pytest -k "low_confidence" -v
 
 # Run all Stage 3 spelling tests:
-pytest test_geocode_v2.py -k "spelling" -v
+pytest -k "spelling" -v
 ```
 
 ---

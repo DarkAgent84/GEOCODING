@@ -10,6 +10,17 @@ param(
     [string[]]$ScriptArgs
 )
 
+# Resolve project root directory regardless of invocation location
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (Test-Path "$ScriptDir\geocode_valid_addresses_v2.py") {
+    $ProjectRoot = $ScriptDir
+} elseif (Test-Path "$ScriptDir\..\geocode_valid_addresses_v2.py") {
+    $ProjectRoot = (Resolve-Path "$ScriptDir\..").Path
+} else {
+    $ProjectRoot = (Get-Location).Path
+}
+Set-Location $ProjectRoot
+
 # If arguments were provided directly on the CLI, forward them directly to Python
 if ($ScriptArgs.Count -gt 0) {
     & python geocode_valid_addresses_v2.py @ScriptArgs
@@ -53,7 +64,7 @@ while ($true) {
             }
         }
         "3" {
-            Write-Host "`n[INFO] Running Pipeline in CSV Offline Mode (--no-api)..." -ForegroundColor Green
+            Write-Host "`n[INFO] Running Pipeline in CSV Offline Mode (No API)..." -ForegroundColor Green
             & python geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
         }
         "4" {

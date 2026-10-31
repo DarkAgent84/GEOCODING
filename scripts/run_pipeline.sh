@@ -3,6 +3,18 @@
 # Credility Geocoding Pipeline Runner (Linux / macOS / Bash Script)
 # ==============================================================================
 
+# Resolve project root directory regardless of invocation location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/geocode_valid_addresses_v2.py" ]; then
+    PROJECT_ROOT="$SCRIPT_DIR"
+elif [ -f "$SCRIPT_DIR/../geocode_valid_addresses_v2.py" ]; then
+    PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+    PROJECT_ROOT="$(pwd)"
+fi
+cd "$PROJECT_ROOT"
+
+# If arguments are provided on command line, pass them directly to the python script
 if [ "$#" -gt 0 ]; then
     python3 geocode_valid_addresses_v2.py "$@"
     exit $?
@@ -44,7 +56,7 @@ while true; do
             ;;
         3)
             echo ""
-            echo "[INFO] Running Pipeline in CSV Offline Mode (--no-api)..."
+            echo "[INFO] Running Pipeline in CSV Offline Mode (No API)..."
             python3 geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
             ;;
         4)

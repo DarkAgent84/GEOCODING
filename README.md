@@ -33,7 +33,7 @@ Address Input
       ├─► Partial Match (partial_match=True) ───────────► Score: 50    | Geocoding + Places
       ├─► Interpolated Match ───────────────────────────► Score: 45    | Geocoding + Places
       ├─► Street-Level Match ───────────────────────────► Score: 35    | Geocoding Only
-      ├─► Area / Locality Centroid ─────────────────────► Score: 10    | Geocoding Only
+      ├─► Low Confidence / Area Centroid ──────────────► Score: 31    | Geocoding Only
       └─► Unresolved / Not Found ───────────────────────► Score: 0     | Geocoding Attempted
 ```
 

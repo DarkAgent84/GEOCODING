@@ -5,6 +5,17 @@ setlocal enabledelayedexpansion
 :: Credility Geocoding Pipeline Runner (Windows Batch Script)
 :: ==============================================================================
 
+:: Resolve project root directory regardless of invocation location
+set "SCRIPT_DIR=%~dp0"
+if exist "%SCRIPT_DIR%geocode_valid_addresses_v2.py" (
+    set "PROJECT_ROOT=%SCRIPT_DIR%"
+) else if exist "%SCRIPT_DIR%..\geocode_valid_addresses_v2.py" (
+    set "PROJECT_ROOT=%SCRIPT_DIR%..\"
+) else (
+    set "PROJECT_ROOT=%CD%\"
+)
+cd /d "%PROJECT_ROOT%"
+
 :: If arguments are provided on command line, pass them directly to the python script
 if not "%~1"=="" (
     python geocode_valid_addresses_v2.py %*
@@ -59,7 +70,7 @@ goto FINISHED
 
 :OFFLINE_CSV
 echo.
-echo [INFO] Running Pipeline in CSV Offline Mode (--no-api)...
+echo [INFO] Running Pipeline in CSV Offline Mode (No API)...
 python geocode_valid_addresses_v2.py --no-api --workers 8 --batch-size 50
 goto FINISHED
 
