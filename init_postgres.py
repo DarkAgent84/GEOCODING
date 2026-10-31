@@ -5,7 +5,6 @@ Initialize and manage PostgreSQL tables for the GEOCODING project.
 Usage:
   python init_postgres.py --status
   python init_postgres.py --reload-input
-  python init_postgres.py --reload-processed
 """
 import argparse
 import os
@@ -47,8 +46,12 @@ def create_tables(conn, schema="public"):
 def load_input_csv(conn, csv_path="GEOCODING.csv", schema="public", table="geocoding", batch_size=1000):
     """Load or reload GEOCODING.csv into PostgreSQL with upsert."""
     if not os.path.isfile(csv_path):
-        print(f"ERROR: File not found: {csv_path}")
-        return
+        candidate = os.path.join("data", "input", csv_path)
+        if os.path.isfile(candidate):
+            csv_path = candidate
+        else:
+            print(f"ERROR: File not found: {csv_path}")
+            return
     create_tables(conn, schema)
     print(f"Reading {csv_path}...")
     try:
@@ -150,4 +153,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

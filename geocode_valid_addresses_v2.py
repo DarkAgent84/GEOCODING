@@ -94,9 +94,29 @@ API_KEY_ENV = "GOOGLE_API_KEY"
 GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 
-DEFAULT_INPUT_CSV = "GEOCODING.csv"
-DEFAULT_OUTPUT_CSV = "GEOCODING_processed.csv"
-DEFAULT_CACHE_DB = "geocode_cache.db"
+def _resolve_input_path(filename: str = "GEOCODING.csv") -> str:
+    for c in [filename, os.path.join("data", "input", filename),
+              os.path.join(os.path.dirname(__file__), "..", "data", "input", filename),
+              os.path.join(os.path.dirname(__file__), "..", filename)]:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return filename
+
+def _resolve_output_path(filename: str = "GEOCODING_processed.csv") -> str:
+    for d in ["data/output", os.path.join(os.path.dirname(__file__), "..", "data", "output")]:
+        if os.path.isdir(d):
+            return os.path.abspath(os.path.join(d, filename))
+    return filename
+
+def _resolve_cache_db(filename: str = "geocode_cache.db") -> str:
+    for d in ["data/cache", os.path.join(os.path.dirname(__file__), "..", "data", "cache")]:
+        if os.path.isdir(d):
+            return os.path.abspath(os.path.join(d, filename))
+    return filename
+
+DEFAULT_INPUT_CSV = _resolve_input_path("GEOCODING.csv")
+DEFAULT_OUTPUT_CSV = _resolve_output_path("GEOCODING_processed.csv")
+DEFAULT_CACHE_DB = _resolve_cache_db("geocode_cache.db")
 # Google's terms limit how long geocoded coordinates may be cached (30 days at the time of
 # writing - check your own agreement).  Cache rows older than this are ignored.  0 = never expire.
 DEFAULT_CACHE_MAX_AGE_DAYS = 30

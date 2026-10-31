@@ -77,7 +77,7 @@ while ($true) {
         }
         "5" {
             Write-Host "`n[INFO] Checking PostgreSQL Database Status..." -ForegroundColor Cyan
-            & python init_postgres.py --check
+            & python init_postgres.py --status
         }
         "6" {
             Write-Host "`n[INFO] Running Pytest Test Suite..." -ForegroundColor Cyan

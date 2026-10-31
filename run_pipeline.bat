@@ -86,7 +86,7 @@ goto FINISHED
 :CHECK_DB
 echo.
 echo [INFO] Checking PostgreSQL Database Status...
-python init_postgres.py --check
+python init_postgres.py --status
 goto FINISHED
 
 :RUN_TESTS

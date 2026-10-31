@@ -71,7 +71,7 @@ while true; do
         5)
             echo ""
             echo "[INFO] Checking PostgreSQL Database Status..."
-            python3 init_postgres.py --check
+            python3 init_postgres.py --status
             ;;
         6)
             echo ""
