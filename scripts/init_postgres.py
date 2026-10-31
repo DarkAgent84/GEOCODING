@@ -22,7 +22,7 @@ for p in [_SRC, _ROOT]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from geocode_valid_addresses_v2 import ensure_db_tables
+from src.geocode_valid_addresses_v2 import ensure_db_tables
 
 def load_env():
     for cand in [".env", os.path.join(_ROOT, ".env"), os.path.join(_HERE, "..", ".env"), os.path.join(_HERE, ".env")]:
