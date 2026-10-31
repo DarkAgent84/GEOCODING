@@ -25,3 +25,4 @@ def test_haversine_distance_none_handling():
     assert haversine_distance(19.0, None, 19.0, 73.0) is None
     assert haversine_distance(19.0, 72.0, None, 73.0) is None
     assert haversine_distance(19.0, 72.0, 19.0, None) is None
+

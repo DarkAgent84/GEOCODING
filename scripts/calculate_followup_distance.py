@@ -10,18 +10,20 @@ Calculates:
     Haversine great-circle distance between (gp_latitude, gp_longitude)
     and (follow_current_lat, follow_current_long)
 Stores in:
-    A dedicated table (default: soa_follow_curr_addr_distance) containing ONLY:
-      - dc_loan_number
-      - gp_lat_long
-      - follow_current_lat_long
-      - distance
+    1) The source table itself (soa_follow_curr_addr_analysis):
+       Adds column 'distance' (if not present) and updates the matching records.
+    2) A dedicated separate table (default: soa_follow_curr_addr_distance) containing ONLY:
+       - dc_loan_number
+       - gp_lat_long
+       - follow_current_lat_long
+       - distance
 
 Usage:
     python scripts/calculate_followup_distance.py
     python scripts/calculate_followup_distance.py --unit km
     python scripts/calculate_followup_distance.py --unit m
     python scripts/calculate_followup_distance.py --dry-run
-    python scripts/calculate_followup_distance.py --target-table soa_follow_curr_addr_distance --export-csv distance_results.csv
+    python scripts/calculate_followup_distance.py --export-csv distance_results.csv
 """
 
 import argparse
@@ -158,6 +160,49 @@ def detect_source_columns(conn, schema: str, table: str) -> Dict[str, str]:
     }
 
 
+def update_source_table_distance(
+    conn,
+    schema: str,
+    table: str,
+    cols: Dict[str, str],
+    distance_col: str = "distance",
+    min_confidence: int = 60,
+    unit: str = "km",
+) -> int:
+    """
+    Ensures distance column exists on the source table and updates it
+    directly using PostgreSQL's trigonometric functions for all eligible rows.
+    """
+    r = 6371.0 if unit.lower() == "km" else 6371000.0
+    with conn.cursor() as cur:
+        # Add column if not exists
+        cur.execute(f"ALTER TABLE {schema}.{table} ADD COLUMN IF NOT EXISTS {distance_col} DOUBLE PRECISION;")
+
+        # Update distance values for confidence > min_confidence
+        update_sql = f"""
+            UPDATE {schema}.{table}
+            SET {distance_col} = ROUND(
+                ({r} * acos(
+                    least(1.0, greatest(-1.0, 
+                        cos(radians({cols['gp_lat']})) * cos(radians({cols['follow_lat']})) *
+                        cos(radians({cols['follow_long']}) - radians({cols['gp_long']})) +
+                        sin(radians({cols['gp_lat']})) * sin(radians({cols['follow_lat']}))
+                    ))
+                ))::numeric, 2
+            )::double precision
+            WHERE {cols['confidence_score']} > %s
+              AND {cols['gp_lat']} IS NOT NULL
+              AND {cols['gp_long']} IS NOT NULL
+              AND {cols['follow_lat']} IS NOT NULL
+              AND {cols['follow_long']} IS NOT NULL;
+        """
+        cur.execute(update_sql, (min_confidence,))
+        updated_count = cur.rowcount
+
+    conn.commit()
+    return updated_count
+
+
 def ensure_target_table(conn, schema: str, table: str, drop_existing: bool = False):
     """
     Creates target table with ONLY the 4 requested columns:
@@ -189,6 +234,8 @@ def process_and_store_distances(
     schema: str = "public",
     source_table: str = "soa_follow_curr_addr_analysis",
     target_table: str = "soa_follow_curr_addr_distance",
+    source_dist_col: str = "distance",
+    update_source: bool = True,
     min_confidence: int = 60,
     unit: str = "km",
     batch_size: int = 1000,
@@ -197,10 +244,11 @@ def process_and_store_distances(
     export_csv: Optional[str] = None,
 ) -> int:
     """
-    Extracts matching rows, computes Haversine distance, and bulk inserts into target table.
+    Extracts matching rows, computes Haversine distance, updates source table,
+    and bulk inserts into dedicated 4-column target table.
     """
     cols = detect_source_columns(conn, schema, source_table)
-    print(f"[1/4] Source table columns mapped:")
+    print(f"[1/5] Source table columns mapped:")
     print(f"      Loan No          -> {cols['loan_no']}")
     print(f"      GP Coords        -> ({cols['gp_lat']}, {cols['gp_long']})")
     print(f"      Follow Coords    -> ({cols['follow_lat']}, {cols['follow_long']})")
@@ -223,7 +271,7 @@ def process_and_store_distances(
           AND {cols['follow_long']} IS NOT NULL;
     """
 
-    print(f"\n[2/4] Querying {schema}.{source_table} for records with {cols['confidence_score']} > {min_confidence}...")
+    print(f"\n[2/5] Querying {schema}.{source_table} for records with {cols['confidence_score']} > {min_confidence}...")
     start_time = time.time()
     with conn.cursor() as cur:
         cur.execute(fetch_sql, (min_confidence,))
@@ -235,7 +283,7 @@ def process_and_store_distances(
         return 0
 
     # Calculate distances
-    print(f"\n[3/4] Calculating Haversine distance (unit: {unit.upper()})...")
+    print(f"\n[3/5] Calculating Haversine distance (unit: {unit.upper()})...")
     records_to_insert = []
     distances = []
     for r in raw_rows:
@@ -256,21 +304,38 @@ def process_and_store_distances(
 
     # Dry-run check
     if dry_run:
-        print("\n[DRY RUN] Skipping database insert. Sample 5 calculated records:")
+        print("\n[DRY RUN] Skipping database writes. Sample 5 calculated records:")
         for rec in records_to_insert[:5]:
             print(f"  Loan: {rec[0]} | GP: {rec[1]} | Follow: {rec[2]} | Dist: {rec[3]} {unit}")
         return total_valid
+
+    # Update distance column directly in the source table
+    if update_source:
+        print(f"\n[4/5] Adding/Updating column '{source_dist_col}' in source table {schema}.{source_table}...")
+        u_start = time.time()
+        updated_source = update_source_table_distance(
+            conn=conn,
+            schema=schema,
+            table=source_table,
+            cols=cols,
+            distance_col=source_dist_col,
+            min_confidence=min_confidence,
+            unit=unit,
+        )
+        print(f"      Updated {updated_source:,} rows in {schema}.{source_table} with '{source_dist_col}' ({unit.upper()}) in {time.time() - u_start:.2f}s!")
+    else:
+        print(f"\n[4/5] Skipping source table column update (--no-source-update specified).")
 
     # Ensure destination table exists with only the 4 requested columns
     ensure_target_table(conn, schema, target_table)
 
     if truncate:
-        print(f"\n[4/4] Truncating {schema}.{target_table} before inserting fresh records...")
+        print(f"\n[5/5] Truncating {schema}.{target_table} before inserting fresh records...")
         with conn.cursor() as cur:
             cur.execute(f"TRUNCATE TABLE {schema}.{target_table};")
         conn.commit()
 
-    # Bulk Insert
+    # Bulk Insert into dedicated table
     insert_sql = f"""
         INSERT INTO {schema}.{target_table} (
             dc_loan_number,
@@ -285,7 +350,7 @@ def process_and_store_distances(
     with conn.cursor() as cur:
         extras.execute_batch(cur, insert_sql, records_to_insert, page_size=batch_size)
     conn.commit()
-    print(f"      Successfully inserted {total_valid:,} rows in {time.time() - ins_start:.2f}s!")
+    print(f"      Successfully inserted {total_valid:,} rows into {schema}.{target_table} in {time.time() - ins_start:.2f}s!")
 
     # Optional CSV Export
     if export_csv:
@@ -314,6 +379,16 @@ def main():
         "--target-table",
         default="soa_follow_curr_addr_distance",
         help="Target table name with only 4 columns (default: soa_follow_curr_addr_distance)",
+    )
+    parser.add_argument(
+        "--source-dist-col",
+        default="distance",
+        help="Column name to add/update in source table (default: distance)",
+    )
+    parser.add_argument(
+        "--no-source-update",
+        action="store_true",
+        help="Skip adding/updating the distance column in the source table",
     )
     parser.add_argument(
         "--schema",
@@ -369,6 +444,8 @@ def main():
             schema=args.schema,
             source_table=args.source_table,
             target_table=args.target_table,
+            source_dist_col=args.source_dist_col,
+            update_source=not args.no_source_update,
             min_confidence=args.min_score,
             unit=args.unit,
             batch_size=args.batch_size,
