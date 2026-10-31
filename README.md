@@ -292,20 +292,6 @@ GEOCODING/
 │   ├── run_pipeline.ps1
 │   └── run_pipeline.sh
 │
-├── src/                       # Modular Python Source Code
-│   └── geocoding/
-│       ├── __init__.py        # Public package interface
-│       ├── constants.py       # Scores, thresholds, vocabulary sets, exceptions
-│       ├── config.py          # Dynamic path resolution & .env loader
-│       ├── text_utils.py      # Normalization, token similarity, Haversine
-│       ├── validation.py      # Stages 1-4 (Incomplete, Pincodes, Spelling, Synonyms)
-│       ├── google_client.py   # ApiClient, QPS rate limiter, backoff, trimming
-│       ├── cache.py           # DiskCache (SQLite) & PostgresCache (PostgreSQL)
-│       ├── scoring.py         # Place evaluation, geofence radius, remarks builder
-│       ├── db.py              # PostgreSQL streaming batches, migrations, upserts
-│       ├── pipeline.py        # Worker thread pool, deterministic row order, CSV locking
-│       └── cli.py             # CLI argument parser & main execution runner
-│
 └── tests/                     # Automated Test Suite
     ├── __init__.py
     └── test_geocode_v2.py     # 108 unit, mock, integration & regression tests
