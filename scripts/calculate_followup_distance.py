@@ -4,11 +4,9 @@ calculate_followup_distance.py - Calculate distance between Geocoded and Follow-
 
 Reads from:
     soa_follow_curr_addr_analysis (PostgreSQL)
-Filters:
-    gp_confidence_score > 60 AND coordinates are NOT NULL
 Calculates:
     Haversine great-circle distance between (gp_latitude, gp_longitude)
-    and (follow_current_lat, follow_current_long)
+    and (follow_current_lat, follow_current_long) for all eligible records.
 Stores in:
     1) The source table itself (soa_follow_curr_addr_analysis):
        Adds column 'distance' (if not present) and updates the matching records.
@@ -19,11 +17,21 @@ Stores in:
        - distance
 
 Usage:
+    # 1. Calculate distance for EACH AND EVERY record (default: all records with coordinates)
     python scripts/calculate_followup_distance.py
+
+    # 2. In kilometers or meters
     python scripts/calculate_followup_distance.py --unit km
     python scripts/calculate_followup_distance.py --unit m
+
+    # 3. Include all rows (even those without coordinates, with distance = NULL)
+    python scripts/calculate_followup_distance.py --include-all-rows
+
+    # 4. Filter only high confidence records if desired
+    python scripts/calculate_followup_distance.py --min-score 60
+
+    # 5. Dry-run preview
     python scripts/calculate_followup_distance.py --dry-run
-    python scripts/calculate_followup_distance.py --export-csv distance_results.csv
 """
 
 import argparse
@@ -80,7 +88,7 @@ def get_db_connection():
 
 
 def haversine_distance(
-    lat1: float, lon1: float, lat2: float, lon2: float, unit: str = "km"
+    lat1: Optional[float], lon1: Optional[float], lat2: Optional[float], lon2: Optional[float], unit: str = "km"
 ) -> Optional[float]:
     """
     Calculate great-circle distance between two (lat, lon) points using Haversine formula.
@@ -95,13 +103,21 @@ def haversine_distance(
     if None in (lat1, lon1, lat2, lon2):
         return None
 
+    try:
+        lat1_f, lon1_f = float(lat1), float(lon1)
+        lat2_f, lon2_f = float(lat2), float(lon2)
+        if math.isnan(lat1_f) or math.isnan(lon1_f) or math.isnan(lat2_f) or math.isnan(lon2_f):
+            return None
+    except (ValueError, TypeError):
+        return None
+
     # Earth radius
     r = 6371.0 if unit.lower() == "km" else 6371000.0
 
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
+    phi1 = math.radians(lat1_f)
+    phi2 = math.radians(lat2_f)
+    delta_phi = math.radians(lat2_f - lat1_f)
+    delta_lambda = math.radians(lon2_f - lon1_f)
 
     a = (
         math.sin(delta_phi / 2.0) ** 2
@@ -166,7 +182,7 @@ def update_source_table_distance(
     table: str,
     cols: Dict[str, str],
     distance_col: str = "distance",
-    min_confidence: int = 60,
+    min_confidence: Optional[int] = None,
     unit: str = "km",
 ) -> int:
     """
@@ -174,11 +190,24 @@ def update_source_table_distance(
     directly using PostgreSQL's trigonometric functions for all eligible rows.
     """
     r = 6371.0 if unit.lower() == "km" else 6371000.0
+    where_clauses = [
+        f"{cols['gp_lat']} IS NOT NULL",
+        f"{cols['gp_long']} IS NOT NULL",
+        f"{cols['follow_lat']} IS NOT NULL",
+        f"{cols['follow_long']} IS NOT NULL",
+    ]
+    params: List[Any] = []
+    if min_confidence is not None:
+        where_clauses.append(f"{cols['confidence_score']} > %s")
+        params.append(min_confidence)
+
+    where_str = " AND ".join(where_clauses)
+
     with conn.cursor() as cur:
         # Add column if not exists
         cur.execute(f"ALTER TABLE {schema}.{table} ADD COLUMN IF NOT EXISTS {distance_col} DOUBLE PRECISION;")
 
-        # Update distance values for confidence > min_confidence
+        # Update distance values
         update_sql = f"""
             UPDATE {schema}.{table}
             SET {distance_col} = ROUND(
@@ -190,13 +219,9 @@ def update_source_table_distance(
                     ))
                 ))::numeric, 2
             )::double precision
-            WHERE {cols['confidence_score']} > %s
-              AND {cols['gp_lat']} IS NOT NULL
-              AND {cols['gp_long']} IS NOT NULL
-              AND {cols['follow_lat']} IS NOT NULL
-              AND {cols['follow_long']} IS NOT NULL;
+            WHERE {where_str};
         """
-        cur.execute(update_sql, (min_confidence,))
+        cur.execute(update_sql, tuple(params))
         updated_count = cur.rowcount
 
     conn.commit()
@@ -236,7 +261,8 @@ def process_and_store_distances(
     target_table: str = "soa_follow_curr_addr_distance",
     source_dist_col: str = "distance",
     update_source: bool = True,
-    min_confidence: int = 60,
+    min_confidence: Optional[int] = None,
+    include_all_rows: bool = False,
     unit: str = "km",
     batch_size: int = 1000,
     dry_run: bool = False,
@@ -244,17 +270,35 @@ def process_and_store_distances(
     export_csv: Optional[str] = None,
 ) -> int:
     """
-    Extracts matching rows, computes Haversine distance, updates source table,
+    Extracts rows, computes Haversine distance, updates source table,
     and bulk inserts into dedicated 4-column target table.
     """
     cols = detect_source_columns(conn, schema, source_table)
+    filter_desc = f"{cols['confidence_score']} > {min_confidence}" if min_confidence is not None else "ALL records"
     print(f"[1/5] Source table columns mapped:")
     print(f"      Loan No          -> {cols['loan_no']}")
     print(f"      GP Coords        -> ({cols['gp_lat']}, {cols['gp_long']})")
     print(f"      Follow Coords    -> ({cols['follow_lat']}, {cols['follow_long']})")
-    print(f"      Confidence Score -> {cols['confidence_score']} (filter: > {min_confidence})")
+    print(f"      Filter Scope     -> {filter_desc}")
 
-    # Fetch rows
+    # Build WHERE conditions
+    where_clauses = []
+    params: List[Any] = []
+
+    if not include_all_rows:
+        where_clauses.extend([
+            f"{cols['gp_lat']} IS NOT NULL",
+            f"{cols['gp_long']} IS NOT NULL",
+            f"{cols['follow_lat']} IS NOT NULL",
+            f"{cols['follow_long']} IS NOT NULL",
+        ])
+
+    if min_confidence is not None:
+        where_clauses.append(f"{cols['confidence_score']} > %s")
+        params.append(min_confidence)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
     fetch_sql = f"""
         SELECT 
             {cols['loan_no']} AS dc_loan_number,
@@ -264,50 +308,51 @@ def process_and_store_distances(
             {cols['follow_long']} AS follow_long,
             {cols['confidence_score']} AS gp_score
         FROM {schema}.{source_table}
-        WHERE {cols['confidence_score']} > %s
-          AND {cols['gp_lat']} IS NOT NULL
-          AND {cols['gp_long']} IS NOT NULL
-          AND {cols['follow_lat']} IS NOT NULL
-          AND {cols['follow_long']} IS NOT NULL;
+        {where_sql};
     """
 
-    print(f"\n[2/5] Querying {schema}.{source_table} for records with {cols['confidence_score']} > {min_confidence}...")
+    print(f"\n[2/5] Querying {schema}.{source_table} ({filter_desc})...")
     start_time = time.time()
     with conn.cursor() as cur:
-        cur.execute(fetch_sql, (min_confidence,))
+        cur.execute(fetch_sql, tuple(params))
         raw_rows = cur.fetchall()
 
-    print(f"      Retrieved {len(raw_rows):,} eligible records in {time.time() - start_time:.2f}s")
+    print(f"      Retrieved {len(raw_rows):,} records in {time.time() - start_time:.2f}s")
     if not raw_rows:
         print("      No records found matching criteria.")
         return 0
 
     # Calculate distances
-    print(f"\n[3/5] Calculating Haversine distance (unit: {unit.upper()})...")
+    print(f"\n[3/5] Calculating Haversine distance for records (unit: {unit.upper()})...")
     records_to_insert = []
     distances = []
     for r in raw_rows:
         loan_no, gp_lat, gp_lon, f_lat, f_lon, score = r
         dist = haversine_distance(gp_lat, gp_lon, f_lat, f_lon, unit=unit)
+        gp_ll = f"{gp_lat}, {gp_lon}" if (gp_lat is not None and gp_lon is not None) else None
+        follow_ll = f"{f_lat}, {f_lon}" if (f_lat is not None and f_lon is not None) else None
+        
+        # If not include_all_rows, only keep rows with valid distance
+        if not include_all_rows and dist is None:
+            continue
+
+        records_to_insert.append((str(loan_no) if loan_no is not None else None, gp_ll, follow_ll, dist))
         if dist is not None:
-            gp_ll = f"{gp_lat}, {gp_lon}"
-            follow_ll = f"{f_lat}, {f_lon}"
-            records_to_insert.append((str(loan_no), gp_ll, follow_ll, dist))
             distances.append(dist)
 
-    total_valid = len(records_to_insert)
+    total_records = len(records_to_insert)
     if distances:
-        print(f"      Calculated {total_valid:,} distances.")
+        print(f"      Calculated {len(distances):,} distances.")
         print(f"      Min Distance : {min(distances):.2f} {unit}")
         print(f"      Max Distance : {max(distances):.2f} {unit}")
         print(f"      Mean Distance: {sum(distances) / len(distances):.2f} {unit}")
 
     # Dry-run check
     if dry_run:
-        print("\n[DRY RUN] Skipping database writes. Sample 5 calculated records:")
+        print(f"\n[DRY RUN] Skipping database writes. Sample 5 calculated records (out of {total_records:,}):")
         for rec in records_to_insert[:5]:
             print(f"  Loan: {rec[0]} | GP: {rec[1]} | Follow: {rec[2]} | Dist: {rec[3]} {unit}")
-        return total_valid
+        return total_records
 
     # Update distance column directly in the source table
     if update_source:
@@ -345,12 +390,12 @@ def process_and_store_distances(
         ) VALUES (%s, %s, %s, %s);
     """
 
-    print(f"      Inserting {total_valid:,} rows into {schema}.{target_table} (batch size {batch_size})...")
+    print(f"      Inserting {total_records:,} rows into {schema}.{target_table} (batch size {batch_size})...")
     ins_start = time.time()
     with conn.cursor() as cur:
         extras.execute_batch(cur, insert_sql, records_to_insert, page_size=batch_size)
     conn.commit()
-    print(f"      Successfully inserted {total_valid:,} rows into {schema}.{target_table} in {time.time() - ins_start:.2f}s!")
+    print(f"      Successfully inserted {total_records:,} rows into {schema}.{target_table} in {time.time() - ins_start:.2f}s!")
 
     # Optional CSV Export
     if export_csv:
@@ -363,12 +408,12 @@ def process_and_store_distances(
             writer.writerows(records_to_insert)
         print(f"             Exported {len(records_to_insert):,} rows to CSV.")
 
-    return total_valid
+    return total_records
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Calculate distance between Geocoded and Follow-up coordinates (> 60 confidence score)."
+        description="Calculate distance between Geocoded and Follow-up coordinates for all records."
     )
     parser.add_argument(
         "--source-table",
@@ -398,8 +443,14 @@ def main():
     parser.add_argument(
         "--min-score",
         type=int,
-        default=60,
-        help="Minimum gp_confidence_score strictly greater than this value (default: 60)",
+        default=None,
+        help="Optional minimum gp_confidence_score filter (default: None, calculates for ALL records)",
+    )
+    parser.add_argument(
+        "--include-all-rows",
+        action="store_true",
+        default=False,
+        help="Include all table rows in the target table even if coordinates are null (default: False)",
     )
     parser.add_argument(
         "--unit",
@@ -447,6 +498,7 @@ def main():
             source_dist_col=args.source_dist_col,
             update_source=not args.no_source_update,
             min_confidence=args.min_score,
+            include_all_rows=args.include_all_rows,
             unit=args.unit,
             batch_size=args.batch_size,
             dry_run=args.dry_run,
